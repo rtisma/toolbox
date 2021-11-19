@@ -1,0 +1,54 @@
+#!/bin/bash -e
+#
+# Description:
+# 	Runs the the file renamer
+#
+
+# Do Java check
+
+if type -p java 1>/dev/null; then
+#    echo Found Java in PATH
+    _java=java
+elif [[ -n "$JAVA_HOME" ]] && [[ -x "$JAVA_HOME/bin/java" ]];  then
+#    echo Found Java in JAVA_HOME
+    _java="$JAVA_HOME/bin/java"
+else
+    echo "Java not found. Sing requires Java 11."
+    exit 1
+fi
+
+if [[ "$_java" ]]; then
+    version=$("$_java" -version 2>&1 | awk -F '"' '/version/ {print $2}')
+    regex="^1[1-9][\.]{0,1}"
+    if [[ ! $version =~ $regex ]]; then 
+        echo Java 11 required for Sing. Current version is $version
+        exit 1
+    fi
+fi
+
+here=$(dirname $0)
+if [ "$here" == "." ]; then
+	# This is the case, when the user runs this script from the ./bin directory
+	app_home=../
+else
+	app_home=${here%/bin}
+fi
+
+app_logs=$app_home/logs
+
+if [ ! -d $app_logs ]; then
+	mkdir  -p $app_logs
+elif [ ! -w $app_logs ]; then
+	echo "The logs directory $app_logs is not writeable!"
+	exit 2;
+else
+	touch $app_logs/app.log $app_logs/app.audit.log
+	chmod 664 $app_logs/app.log $app_logs/app.audit.log
+fi
+
+java --illegal-access=deny \
+		 -Dlog.name=app \
+		 -Dlog.path=$app_logs \
+		 -Dlogback.configurationFile=$app_home/conf/logback.xml \
+         -jar $app_home/lib/app.jar \
+         $@
