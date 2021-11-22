@@ -13,7 +13,7 @@ import picocli.CommandLine;
 @RequiredArgsConstructor
 public class CliConfig {
 
-  public static final String APPLICATION_NAME = "DMS";
+  public static final String APPLICATION_NAME = "File-Renamer";
 
   private static final String HELP_HEADER_GUIDE_URLS = "Help Menu";
 

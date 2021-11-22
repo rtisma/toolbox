@@ -14,6 +14,7 @@
     <picocli.version>4.6.2</picocli.version>
     <lombok.version>1.18.22</lombok.version>
     <figlet.version>0.0.8</figlet.version>
+    <guava.version>31.0.1-jre</guava.version>
     <logback.version>1.2.7</logback.version>
     <plugin.maven-assembly>3.1.1</plugin.maven-assembly>
   </properties>
@@ -29,6 +30,11 @@
       <artifactId>lombok</artifactId>
       <version>${lombok.version}</version>
       <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>${guava.version}</version>
     </dependency>
     <dependency>
       <groupId>com.github.lalyos</groupId>
