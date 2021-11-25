@@ -40,6 +40,13 @@ public class RootCommand implements Callable<Integer>
   private String regex;
 
   @Option(
+      names = {"-p", "--collision-prefix"},
+      description = "Prefix to use to mark colliding files",
+      required = false,
+      defaultValue = "md5" )
+  private String collisionPrefix;
+
+  @Option(
       names = {"-r", "--recursive"},
       description = "Recursively search",
       required = true)
@@ -58,7 +65,7 @@ public class RootCommand implements Callable<Integer>
       CommandLine.usage(this, System.out);
     } else  {
       val paths = files.stream().map(File::toPath).collect(toUnmodifiableList());
-      try(val renamer = createRenamer(threads)){
+      try(val renamer = createRenamer(threads, collisionPrefix)){
         renamer.rename(paths, regex, recursive);
       }
     }

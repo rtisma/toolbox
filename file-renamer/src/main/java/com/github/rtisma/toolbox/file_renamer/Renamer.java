@@ -7,6 +7,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -16,9 +17,10 @@ import java.util.regex.Pattern;
 
 import com.google.common.base.Joiner;
 import com.google.common.hash.Hashing;
+import lombok.Builder;
 import lombok.NonNull;
-import lombok.RequiredArgsConstructor;
 import lombok.SneakyThrows;
+import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 
@@ -30,20 +32,24 @@ import static java.util.stream.Collectors.toUnmodifiableList;
 import static lombok.Lombok.sneakyThrow;
 
 @Slf4j
-@RequiredArgsConstructor
 public class Renamer implements AutoCloseable
 {
 
-  private static final Pattern PATTERN = Pattern.compile("^(.*)\\.([^\\.]+)$");
-
   @NonNull private final ExecutorService executor;
+  @NonNull private final String collisionPrefix;
+  @NonNull private final Pattern markerPattern;
+
+  public Renamer(@NonNull final ExecutorService executor, @NonNull final String collisionPrefix) {
+    this.executor = executor;
+    this.collisionPrefix = collisionPrefix;
+    this.markerPattern = Pattern.compile("^.*__"+this.collisionPrefix+"\\-[a-f0-9]{32}(\\.[^\\.]+)?$");
+  }
 
   @SneakyThrows
   public void rename(@NonNull final List<Path> rootPaths, @NonNull final String matchPattern, final boolean recursive) {
     val futures = new ArrayList<Future<?>>();
     rename2(futures, rootPaths, matchPattern, recursive);
     waitForFutures(futures);
-    log.info("doneeeeeeeeeeeee");
   }
 
   @SneakyThrows
@@ -74,9 +80,20 @@ public class Renamer implements AutoCloseable
           })
           .filter(Files::isRegularFile)
           .filter(x -> pattern.matcher(x.getFileName().toString()).matches())
+          .filter(file -> !isMarked(file))
           .forEach(x -> executor.submit(() -> rename(x)));
     }
-    log.warn("The following were missing paths: [{}]", Joiner.on(", ").join(missing));
+    if (!missing.isEmpty()){
+      log.warn("The following were missing paths: [{}]", Joiner.on(", ").join(missing));
+    }
+  }
+
+  private boolean isMarked(Path file) {
+    val result = markerPattern.matcher(file.getFileName().toString()).matches();
+    if (result){
+      log.warn("{} is marked", file);
+    }
+    return result;
   }
 
   @Override
@@ -95,20 +112,43 @@ public class Renamer implements AutoCloseable
   }
 
 
-  private static Path appendMd5String(Path file, String md5) {
-    val matcher = PATTERN.matcher(file.toString());
-    String out;
-    if (matcher.matches()) {
-      out = matcher.group(1)+"__md5-"+md5+"."+matcher.group(2);
-    } else {
-      out = file+"-"+md5;
+  @Value
+  @Builder
+  private static class FileNameElements {
+    private static final Pattern PATTERN = Pattern.compile("^(.*)\\.([^\\.]+)$");
+
+    String name;
+    String extension;
+
+    public static Optional<FileNameElements> parseFrom(String filename) {
+      val matcher = PATTERN.matcher(filename);
+      if (matcher.matches()) {
+        return  Optional.of(FileNameElements.builder()
+            .name(matcher.group(1))
+            .extension(matcher.group(2))
+            .build());
+      }
+      return Optional.empty();
     }
-    return Paths.get(out);
   }
 
-  //TODO: check if it was already renamed
+  private String getMarkerPrefix() {
+    return "__"+this.collisionPrefix+"-";
+  }
+
+
+  private String generateMd5Text(String md5) {
+    return getMarkerPrefix()+md5;
+  }
+
+  private Path appendMd5String(Path file, String md5) {
+    return Paths.get(FileNameElements.parseFrom(file.toString())
+        .map(x -> x.getName()+generateMd5Text(md5)+"."+x.getExtension())
+        .orElse(file+generateMd5Text(md5)));
+  }
+
   @SneakyThrows
-  private static void rename(Path file) {
+  private void rename(Path file) {
     val newFile = appendMd5String(file, getMd5(file));
     file.toFile().renameTo(newFile.toFile());
     log.info("{} ---> {}", file, newFile);
@@ -125,7 +165,7 @@ public class Renamer implements AutoCloseable
         });
   }
 
-  public static Renamer createRenamer(final int numThreads) {
-    return new Renamer(Executors.newFixedThreadPool(numThreads));
+  public static Renamer createRenamer(final int numThreads, final String collisionPrefix) {
+    return new Renamer(Executors.newFixedThreadPool(numThreads), collisionPrefix);
   }
 }
