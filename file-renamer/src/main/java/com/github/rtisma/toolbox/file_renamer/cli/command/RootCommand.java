@@ -70,7 +70,7 @@ public class RootCommand implements Callable<Integer>
       CommandLine.usage(this, System.out);
     } else  {
       val paths = files.stream().map(File::toPath).collect(toUnmodifiableList());
-      try(val renamer = createRenamer(threads, collisionPrefix)){
+      try(val renamer = createRenamer(threads, collisionPrefix, dryRun)){
         renamer.rename(paths, regex, recursive);
       }
     }
