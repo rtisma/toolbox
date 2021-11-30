@@ -58,6 +58,11 @@ public class RootCommand implements Callable<Integer>
       required = false)
   private List<File> files;
 
+  @Option(
+      names = {"-n", "--dry-run"},
+      description = "Dry run. Will calculate md5 tho",
+      required = false)
+  private boolean dryRun;
 
   @Override
   public Integer call() throws Exception {

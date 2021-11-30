@@ -10,7 +10,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
@@ -28,6 +27,7 @@ import static java.nio.file.Files.isDirectory;
 import static java.nio.file.Files.isRegularFile;
 import static java.nio.file.Files.readAllBytes;
 import static java.util.Objects.nonNull;
+import static java.util.concurrent.Executors.newFixedThreadPool;
 import static java.util.stream.Collectors.toUnmodifiableList;
 import static lombok.Lombok.sneakyThrow;
 
@@ -38,10 +38,14 @@ public class Renamer implements AutoCloseable
   @NonNull private final ExecutorService executor;
   @NonNull private final String collisionPrefix;
   @NonNull private final Pattern markerPattern;
+  private final boolean dryRun;
 
-  public Renamer(@NonNull final ExecutorService executor, @NonNull final String collisionPrefix) {
+
+  public Renamer(@NonNull final ExecutorService executor, @NonNull final String collisionPrefix,
+                 final boolean dryRun) {
     this.executor = executor;
     this.collisionPrefix = collisionPrefix;
+    this.dryRun = dryRun;
     this.markerPattern = Pattern.compile("^.*__"+this.collisionPrefix+"\\-[a-f0-9]{32}(\\.[^\\.]+)?$");
   }
 
@@ -150,8 +154,13 @@ public class Renamer implements AutoCloseable
   private void rename(Path file) {
     try{
       val newFile = appendMd5String(file, getMd5(file));
-      file.toFile().renameTo(newFile.toFile());
-      log.info("{} ---> {}", file, newFile);
+      val message = String.format("%s ---> %s", file, newFile);
+      if (dryRun) {
+        log.info("[DRY-RUN] "+message);
+      } else {
+        file.toFile().renameTo(newFile.toFile());
+        log.info(message);
+      }
     } catch (IOException e) {
       log.error("Could not getMd5 for file '{}', skipping...", file);
       throw e;
@@ -169,7 +178,7 @@ public class Renamer implements AutoCloseable
         });
   }
 
-  public static Renamer createRenamer(final int numThreads, final String collisionPrefix) {
-    return new Renamer(Executors.newFixedThreadPool(numThreads), collisionPrefix);
+  public static Renamer createRenamer(final int numThreads, final String collisionPrefix, final boolean dryRun) {
+    return new Renamer(newFixedThreadPool(numThreads), collisionPrefix, dryRun);
   }
 }
