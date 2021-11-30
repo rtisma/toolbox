@@ -9,11 +9,13 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 import picocli.CommandLine;
+import picocli.CommandLine.ArgGroup;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
 import static com.github.rtisma.toolbox.file_renamer.Renamer.createRenamer;
 import static java.util.Objects.isNull;
+import static java.util.Objects.nonNull;
 import static java.util.stream.Collectors.toUnmodifiableList;
 
 @Slf4j
@@ -26,12 +28,8 @@ import static java.util.stream.Collectors.toUnmodifiableList;
 public class RootCommand implements Callable<Integer>
 {
 
-  @Option(
-      names = {"-t", "--threads"},
-      description = "Num threads",
-      defaultValue = "4",
-      required = true)
-  private int threads;
+  @ArgGroup(exclusive = true, multiplicity = "1")
+  private ThreadOptions threadOptions;
 
   @Option(
       names = {"-s", "--search"},
@@ -49,7 +47,7 @@ public class RootCommand implements Callable<Integer>
   @Option(
       names = {"-r", "--recursive"},
       description = "Recursively search",
-      required = true)
+      required = false)
   private boolean recursive;
 
   @Option(
@@ -70,10 +68,47 @@ public class RootCommand implements Callable<Integer>
       CommandLine.usage(this, System.out);
     } else  {
       val paths = files.stream().map(File::toPath).collect(toUnmodifiableList());
-      try(val renamer = createRenamer(threads, collisionPrefix, dryRun)){
+      val resolvedThreads = threadOptions.resolveNumThreads();
+      try(val renamer = createRenamer(resolvedThreads, collisionPrefix, dryRun)){
         renamer.rename(paths, regex, recursive);
       }
     }
     return 0;
   }
+
+  static class ThreadOptions {
+    @Option(
+        names = {"-t", "--threads"},
+        description = "Num threads",
+        required = true)
+    private Integer threads;
+
+    @Option(
+        names = {"-a", "--all-threads"},
+        description = "All threads",
+        required = true)
+    private Boolean allThreads;
+
+    private boolean isThreadsDefined() {
+      return nonNull(threads);
+    }
+
+    private boolean isAllThreadsDefined() {
+      return nonNull(allThreads);
+    }
+
+    public int resolveNumThreads() {
+      if (isAllThreadsDefined()) {
+        val availableThreads = Runtime.getRuntime().availableProcessors();
+        return allThreads ? availableThreads : availableThreads/4;
+      } else if (isThreadsDefined()) {
+
+        return threads;
+      } else {
+        throw new IllegalStateException("should not be here");
+      }
+
+    }
+  }
+
 }
