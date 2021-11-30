@@ -104,8 +104,7 @@ public class Renamer implements AutoCloseable
     }
   }
 
-  @SneakyThrows
-  private static String getMd5(Path file) {
+  private static String getMd5(Path file) throws IOException {
     return Hashing.md5()
         .hashBytes(readAllBytes(file))
         .toString();
@@ -149,9 +148,14 @@ public class Renamer implements AutoCloseable
 
   @SneakyThrows
   private void rename(Path file) {
-    val newFile = appendMd5String(file, getMd5(file));
-    file.toFile().renameTo(newFile.toFile());
-    log.info("{} ---> {}", file, newFile);
+    try{
+      val newFile = appendMd5String(file, getMd5(file));
+      file.toFile().renameTo(newFile.toFile());
+      log.info("{} ---> {}", file, newFile);
+    } catch (IOException e) {
+      log.error("Could not getMd5 for file '{}', skipping...", file);
+      throw e;
+    }
   }
 
   private static void waitForFutures(Collection<? extends Future<?>> futures) {
