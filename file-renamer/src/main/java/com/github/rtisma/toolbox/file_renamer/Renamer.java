@@ -39,13 +39,17 @@ public class Renamer implements AutoCloseable
   @NonNull private final String collisionPrefix;
   @NonNull private final Pattern markerPattern;
   private final boolean dryRun;
+  private final boolean calcMd5;
 
 
-  public Renamer(@NonNull final ExecutorService executor, @NonNull final String collisionPrefix,
-                 final boolean dryRun) {
+  public Renamer(
+      @NonNull final ExecutorService executor, @NonNull final String collisionPrefix,
+      final boolean dryRun,
+      final boolean calcMd5) {
     this.executor = executor;
     this.collisionPrefix = collisionPrefix;
     this.dryRun = dryRun;
+    this.calcMd5 = calcMd5;
     this.markerPattern = Pattern.compile("^.*__"+this.collisionPrefix+"\\-[a-f0-9]{32}(\\.[^\\.]+)?$");
   }
 
@@ -153,14 +157,22 @@ public class Renamer implements AutoCloseable
   @SneakyThrows
   private void rename(Path file) {
     try{
-      val newFile = appendMd5String(file, getMd5(file));
-      val message = String.format("%s ---> %s", file, newFile);
+      String message = null;
+      Path newFile = null;
+      if (!dryRun || calcMd5) {
+        newFile = appendMd5String(file, getMd5(file));
+      } else {
+        newFile = Paths.get(file+getMarkerPrefix()+"SOME_MD5");
+      }
+
+      message = String.format("%s ---> %s", file, newFile);
       if (dryRun) {
         log.info("[DRY-RUN] "+message);
       } else {
         file.toFile().renameTo(newFile.toFile());
         log.info(message);
       }
+
     } catch (IOException e) {
       log.error("Could not getMd5 for file '{}', skipping...", file);
       throw e;
@@ -178,7 +190,8 @@ public class Renamer implements AutoCloseable
         });
   }
 
-  public static Renamer createRenamer(final int numThreads, final String collisionPrefix, final boolean dryRun) {
-    return new Renamer(newFixedThreadPool(numThreads), collisionPrefix, dryRun);
+  public static Renamer createRenamer(final int numThreads, final String collisionPrefix,
+                                      final boolean dryRun, final boolean calcMd5) {
+    return new Renamer(newFixedThreadPool(numThreads), collisionPrefix, dryRun, calcMd5);
   }
 }

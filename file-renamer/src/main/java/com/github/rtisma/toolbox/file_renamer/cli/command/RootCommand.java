@@ -31,6 +31,9 @@ public class RootCommand implements Callable<Integer>
   @ArgGroup(exclusive = true, multiplicity = "1")
   private ThreadOptions threadOptions;
 
+  @ArgGroup(exclusive = false)
+  private DryRunOptions dryRunOptions;
+
   @Option(
       names = {"-s", "--search"},
       description = "Regex to match filenames against",
@@ -56,11 +59,7 @@ public class RootCommand implements Callable<Integer>
       required = false)
   private List<File> files;
 
-  @Option(
-      names = {"-n", "--dry-run"},
-      description = "Dry run. Will calculate md5 tho",
-      required = false)
-  private boolean dryRun;
+
 
   @Override
   public Integer call() throws Exception {
@@ -69,7 +68,7 @@ public class RootCommand implements Callable<Integer>
     } else  {
       val paths = files.stream().map(File::toPath).collect(toUnmodifiableList());
       val resolvedThreads = threadOptions.resolveNumThreads();
-      try(val renamer = createRenamer(resolvedThreads, collisionPrefix, dryRun)){
+      try(val renamer = createRenamer(resolvedThreads, collisionPrefix, dryRunOptions.dryRun, dryRunOptions.calcMd5)){
         renamer.rename(paths, regex, recursive);
       }
     }
@@ -109,6 +108,20 @@ public class RootCommand implements Callable<Integer>
       }
 
     }
+  }
+
+  static class DryRunOptions {
+    @Option(
+        names = {"-n", "--dry-run"},
+        description = "Dry run to show which files are affected",
+        required = false)
+    private boolean dryRun;
+
+    @Option(
+        names = {"-m", "--md5"},
+        description = "Also calculate md5",
+        required = false)
+    private boolean calcMd5;
   }
 
 }
