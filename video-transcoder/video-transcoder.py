@@ -19,14 +19,18 @@ and VMAF scores is written.
     python3 video-transcoder.py input.mov --no-compare
     python3 video-transcoder.py ./videos/ --jobs 3
     python3 video-transcoder.py ./videos/ --jobs 3 --report ./videos/report.json
+    python3 video-transcoder.py ./videos/ --retries 2 --slack-webhook https://hooks.slack.com/services/...
 """
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -172,10 +176,17 @@ def process_one(input_path, output_path, args):
     if args.dry_run:
         return {**entry, "status": "dry-run"}
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    max_attempts = args.retries + 1
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            print(f"retrying {input_path} (attempt {attempt}/{max_attempts})")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            break
         output_path.unlink(missing_ok=True)  # drop any partial output so a re-run retries this file
-        return {**entry, "status": "error", "error": result.stderr.strip()[-2000:]}
+        if attempt == max_attempts:
+            return {**entry, "status": "error", "error": result.stderr.strip()[-2000:], "attempts": attempt}
+    entry["attempts"] = attempt
 
     original_bytes = input_path.stat().st_size
     converted_bytes = output_path.stat().st_size
@@ -200,18 +211,31 @@ def process_one(input_path, output_path, args):
 
 def summarize_entry(entry):
     if entry["status"] == "error":
-        return f"[error] {entry['file']}: {entry['error']}"
+        attempts_note = f" (failed after {entry['attempts']} attempts)" if entry.get("attempts", 1) > 1 else ""
+        return f"[error] {entry['file']}: {entry['error']}{attempts_note}"
     if entry["status"] == "dry-run":
         return f"[dry-run] {entry['file']} -> {entry['output']}"
     parts = [
         f"[ok] {entry['file']} -> {entry['output']}",
         f"{human_size(entry['original_bytes'])} -> {human_size(entry['converted_bytes'])} ({entry['savings_percent']:+.1f}%)",
     ]
+    if entry.get("attempts", 1) > 1:
+        parts.append(f"succeeded after {entry['attempts']} attempts")
     if "vmaf" in entry:
         parts.append(f"VMAF {entry['vmaf']:.2f} ({entry['vmaf_rating']})")
     elif "vmaf_error" in entry:
         parts.append(f"VMAF error: {entry['vmaf_error']}")
     return " | ".join(parts)
+
+
+def notify_slack(webhook_url, message):
+    payload = json.dumps({"text": message}).encode("utf-8")
+    req = urllib.request.Request(webhook_url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except urllib.error.URLError as err:
+        print(f"warning: slack notification failed: {err}", file=sys.stderr)
 
 
 def run_batch(files, args, output_dir):
@@ -241,12 +265,17 @@ def parse_args(argv):
                          help="after encoding, compute the VMAF score against the source (default: on; use --no-compare to skip)")
     parser.add_argument("-j", "--jobs", type=int, default=4, help="number of files to convert concurrently in directory mode (default: 4)")
     parser.add_argument("-r", "--report", type=Path, help="path for the JSON report in directory mode (default: <directory>/conversion-report.json)")
+    parser.add_argument("--retries", type=int, default=0, help="retry a failed conversion this many times (default: 0)")
+    parser.add_argument("--slack-webhook", default=os.environ.get("SLACK_WEBHOOK_URL"),
+                         help="Slack incoming webhook URL for a completion notification (default: $SLACK_WEBHOOK_URL)")
     args = parser.parse_args(argv)
 
     if not args.input.exists():
         parser.error(f"input path not found: {args.input}")
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
+    if args.retries < 0:
+        parser.error("--retries must be >= 0")
     if args.crf is None:
         args.crf = DEFAULT_CRF[args.codec]
     if args.preset is None:
@@ -276,6 +305,13 @@ def main(argv=None):
         total_saved = sum(r["savings_bytes"] for r in ok)
         print(f"done: {len(ok)} converted, {len(errors)} failed, {human_size(total_saved)} saved total")
         print(f"report written to {report_path}")
+
+        if args.slack_webhook:
+            lines = [f"*video-transcoder* `{args.input}`: {len(ok)} converted, {len(errors)} failed, {human_size(total_saved)} saved total"]
+            if errors:
+                lines.append("Failed: " + ", ".join(Path(e["file"]).name for e in errors))
+            notify_slack(args.slack_webhook, "\n".join(lines))
+
         return 1 if errors else 0
 
     output_path = args.output or default_output_path(args.input)
@@ -284,6 +320,10 @@ def main(argv=None):
     if args.report:
         args.report.write_text(json.dumps([entry], indent=2))
         print(f"report written to {args.report}")
+
+    if args.slack_webhook and entry["status"] != "dry-run":
+        notify_slack(args.slack_webhook, f"*video-transcoder* `{args.input.name}`: {summarize_entry(entry)}")
+
     return 0 if entry["status"] in ("ok", "dry-run") else 1
 
 

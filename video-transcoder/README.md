@@ -19,6 +19,9 @@ python3 video-transcoder.py input.mov --no-compare
 # directory mode: convert every video in ./videos, 3 at a time
 python3 video-transcoder.py ./videos/ --jobs 3
 python3 video-transcoder.py ./videos/ --jobs 3 --report ./videos/report.json
+
+# retry failures up to twice, and post a summary to Slack when done
+python3 video-transcoder.py ./videos/ --retries 2 --slack-webhook https://hooks.slack.com/services/...
 ```
 
 Output files are always named `<basename>.converted.mp4` unless `-o` is
@@ -35,6 +38,8 @@ given — `myfile.mov` becomes `myfile.converted.mp4`.
 | `--compare`/`--no-compare` | on | after encoding, score the output against the source with VMAF |
 | `-j/--jobs` | `4` | directory mode: how many files to convert concurrently |
 | `-r/--report` | `<directory>/conversion-report.json` | directory mode: where to write the JSON report |
+| `--retries` | `0` | retry a failed conversion this many times before giving up |
+| `--slack-webhook` | `$SLACK_WEBHOOK_URL` | if set, post a completion summary to this Slack incoming webhook |
 
 By default, after encoding the script runs a VMAF (Netflix's perceptual
 quality metric) comparison between the output and the original source,
@@ -68,7 +73,15 @@ space savings, and VMAF score:
 ```
 
 A file that fails to convert gets `"status": "error"` with an `"error"`
-message instead, and doesn't stop the rest of the batch.
+message instead, and doesn't stop the rest of the batch. Pass `--retries N`
+to retry a failing file up to `N` additional times (each retry deletes the
+partial output first) before it's marked as failed; successful entries that
+needed a retry get an `"attempts"` field.
+
+If `--slack-webhook` (or `$SLACK_WEBHOOK_URL`) is set, a summary — counts,
+total space saved, and any failed filenames — is posted there when the batch
+finishes. Single-file conversions post a one-line result instead. A failed
+Slack POST only prints a warning; it never fails the conversion itself.
 
 The bitrate cap is picked from the target resolution using YouTube's
 published SDR upload-bitrate guidance as the H.264 baseline (2160p 45Mbps,
