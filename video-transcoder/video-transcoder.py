@@ -174,7 +174,10 @@ def process_one(input_path, output_path, args):
     entry["maxrate_kbps"] = cap_kbps
 
     if args.dry_run:
-        return {**entry, "status": "dry-run"}
+        dry_entry = {**entry, "status": "dry-run"}
+        if args.retries:
+            dry_entry["retry_policy"] = f"would retry up to {args.retries} time(s) on failure"
+        return dry_entry
 
     max_attempts = args.retries + 1
     for attempt in range(1, max_attempts + 1):
@@ -214,7 +217,10 @@ def summarize_entry(entry):
         attempts_note = f" (failed after {entry['attempts']} attempts)" if entry.get("attempts", 1) > 1 else ""
         return f"[error] {entry['file']}: {entry['error']}{attempts_note}"
     if entry["status"] == "dry-run":
-        return f"[dry-run] {entry['file']} -> {entry['output']}"
+        line = f"[dry-run] {entry['file']} -> {entry['output']}"
+        if entry.get("retry_policy"):
+            line += f" ({entry['retry_policy']})"
+        return line
     parts = [
         f"[ok] {entry['file']} -> {entry['output']}",
         f"{human_size(entry['original_bytes'])} -> {human_size(entry['converted_bytes'])} ({entry['savings_percent']:+.1f}%)",
@@ -226,6 +232,85 @@ def summarize_entry(entry):
     elif "vmaf_error" in entry:
         parts.append(f"VMAF error: {entry['vmaf_error']}")
     return " | ".join(parts)
+
+
+def _error_tail(error_text, limit=200):
+    """Pull the root-cause line out of an ffmpeg/ffprobe error: the first line
+    mentioning "error" (ffmpeg logs cascade top-down from the real failure into
+    generic thread-termination noise), falling back to the last non-empty line."""
+    lines = [line.strip() for line in error_text.strip().splitlines() if line.strip()]
+    if not lines:
+        return error_text.strip()[:limit]
+    for line in lines:
+        if "error" in line.lower():
+            return line[:limit]
+    return lines[-1][:limit]
+
+
+def build_batch_slack_message(args, input_dir, results, report_path):
+    dry = [r for r in results if r["status"] == "dry-run"]
+    if dry:
+        settings = f"codec `{args.codec}` · CRF `{args.crf}` · jobs `{args.jobs}`"
+        if args.retries:
+            settings += f" · retries `{args.retries}`"
+        lines = [
+            f":test_tube: *video-transcoder* — DRY RUN — `{input_dir}`",
+            f"*{len(dry)} file(s)* would be converted ({settings})",
+            "",
+        ]
+        lines.extend(f"• `{Path(r['file']).name}` → `{Path(r['output']).name}`" for r in dry)
+        return "\n".join(lines)
+
+    ok = [r for r in results if r["status"] == "ok"]
+    errors = [r for r in results if r["status"] == "error"]
+    total_saved = sum(r["savings_bytes"] for r in ok)
+    total_original = sum(r["original_bytes"] for r in ok)
+    savings_pct = (total_saved / total_original * 100) if total_original else 0.0
+    vmaf_scores = [r["vmaf"] for r in ok if "vmaf" in r]
+
+    icon = ":white_check_mark:" if not errors else ":warning:"
+    headline = f"*{len(ok)} converted* · *{len(errors)} failed* · *{human_size(total_saved)} saved* ({savings_pct:.1f}%)"
+    if vmaf_scores:
+        headline += f" · avg VMAF *{sum(vmaf_scores) / len(vmaf_scores):.2f}*"
+    lines = [f"{icon} *video-transcoder* — `{input_dir}`", headline]
+
+    if errors:
+        lines.append("")
+        lines.append("*Failed:*")
+        for e in errors:
+            attempts_note = f" _(after {e['attempts']} attempts)_" if e.get("attempts", 1) > 1 else ""
+            lines.append(f"• `{Path(e['file']).name}`{attempts_note} — {_error_tail(e['error'])}")
+
+    settings = f"Codec: `{args.codec}` · CRF: `{args.crf}` · Jobs: `{args.jobs}`"
+    if args.retries:
+        settings += f" · Retries: `{args.retries}`"
+    lines += ["", settings, f"Report: `{report_path}`"]
+    return "\n".join(lines)
+
+
+def build_single_slack_message(input_path, entry, args):
+    if entry["status"] == "dry-run":
+        msg = f":test_tube: *video-transcoder* — DRY RUN — `{input_path.name}` → `{Path(entry['output']).name}`"
+        msg += f"\nCodec: `{args.codec}` · CRF: `{args.crf}`"
+        if args.retries:
+            msg += f" · would retry up to `{args.retries}` time(s) on failure"
+        return msg
+
+    if entry["status"] == "error":
+        attempts_note = f" after {entry['attempts']} attempt(s)" if entry.get("attempts", 1) > 1 else ""
+        return f":x: *video-transcoder* — `{input_path.name}` FAILED{attempts_note}\n```{_error_tail(entry['error'], 300)}```"
+
+    lines = [
+        f":white_check_mark: *video-transcoder* — `{input_path.name}`",
+        f"{human_size(entry['original_bytes'])} → {human_size(entry['converted_bytes'])} (*{entry['savings_percent']:+.1f}%*)",
+    ]
+    if "vmaf" in entry:
+        lines.append(f"VMAF *{entry['vmaf']:.2f}* ({entry['vmaf_rating']})")
+    elif "vmaf_error" in entry:
+        lines.append(f"VMAF error: {entry['vmaf_error']}")
+    if entry.get("attempts", 1) > 1:
+        lines.append(f"Succeeded after {entry['attempts']} attempts")
+    return "\n".join(lines)
 
 
 def notify_slack(webhook_url, message):
@@ -302,15 +387,16 @@ def main(argv=None):
 
         ok = [r for r in results if r["status"] == "ok"]
         errors = [r for r in results if r["status"] == "error"]
-        total_saved = sum(r["savings_bytes"] for r in ok)
-        print(f"done: {len(ok)} converted, {len(errors)} failed, {human_size(total_saved)} saved total")
+        dry = [r for r in results if r["status"] == "dry-run"]
+        if dry:
+            print(f"dry-run: {len(dry)} file(s) would be converted; nothing was written")
+        else:
+            total_saved = sum(r["savings_bytes"] for r in ok)
+            print(f"done: {len(ok)} converted, {len(errors)} failed, {human_size(total_saved)} saved total")
         print(f"report written to {report_path}")
 
         if args.slack_webhook:
-            lines = [f"*video-transcoder* `{args.input}`: {len(ok)} converted, {len(errors)} failed, {human_size(total_saved)} saved total"]
-            if errors:
-                lines.append("Failed: " + ", ".join(Path(e["file"]).name for e in errors))
-            notify_slack(args.slack_webhook, "\n".join(lines))
+            notify_slack(args.slack_webhook, build_batch_slack_message(args, args.input, results, report_path))
 
         return 1 if errors else 0
 
@@ -321,8 +407,8 @@ def main(argv=None):
         args.report.write_text(json.dumps([entry], indent=2))
         print(f"report written to {args.report}")
 
-    if args.slack_webhook and entry["status"] != "dry-run":
-        notify_slack(args.slack_webhook, f"*video-transcoder* `{args.input.name}`: {summarize_entry(entry)}")
+    if args.slack_webhook:
+        notify_slack(args.slack_webhook, build_single_slack_message(args.input, entry, args))
 
     return 0 if entry["status"] in ("ok", "dry-run") else 1
 

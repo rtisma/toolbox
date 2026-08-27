@@ -78,10 +78,26 @@ to retry a failing file up to `N` additional times (each retry deletes the
 partial output first) before it's marked as failed; successful entries that
 needed a retry get an `"attempts"` field.
 
-If `--slack-webhook` (or `$SLACK_WEBHOOK_URL`) is set, a summary — counts,
-total space saved, and any failed filenames — is posted there when the batch
-finishes. Single-file conversions post a one-line result instead. A failed
-Slack POST only prints a warning; it never fails the conversion itself.
+If `--slack-webhook` (or `$SLACK_WEBHOOK_URL`) is set, a formatted summary is
+posted there when the run finishes — status emoji, converted/failed counts,
+total space saved, average VMAF, a bullet per failed file with its root-cause
+error line, and the codec/CRF/jobs/retries settings used. Single-file runs
+post a one-line result (or the error, in a code block, on failure) instead.
+A failed Slack POST only prints a warning; it never fails the conversion.
+
+`--dry-run` combines with both `--retries` and `--slack-webhook` so you can
+test the retry policy and Slack formatting/connectivity without doing any
+real encoding — the message is clearly marked `:test_tube: DRY RUN` and
+lists what *would* be converted instead of real results:
+
+```
+:test_tube: *video-transcoder* — DRY RUN — `./videos`
+*3 file(s)* would be converted (codec `h265` · CRF `28` · jobs `4` · retries `2`)
+
+• `clip1.mov` → `clip1.converted.mp4`
+• `clip2.mov` → `clip2.converted.mp4`
+• `clip3.mov` → `clip3.converted.mp4`
+```
 
 The bitrate cap is picked from the target resolution using YouTube's
 published SDR upload-bitrate guidance as the H.264 baseline (2160p 45Mbps,
