@@ -10,6 +10,7 @@ halved for H.265 (HEVC typically matches H.264 quality at ~50% of the bits).
     python3 video-transcoder.py input.mov
     python3 video-transcoder.py input.mov --codec h264 --height 480
     python3 video-transcoder.py input.mov -o out.mp4 --crf 25 --dry-run
+    python3 video-transcoder.py input.mov --compare
 """
 
 import argparse
@@ -17,7 +18,15 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+VMAF_RATINGS = [
+    (93, "near-transparent, no perceptible loss for most viewers"),
+    (80, "good, minor loss visible on close inspection"),
+    (60, "noticeable degradation"),
+    (0, "poor"),
+]
 
 # kbps caps, keyed by vertical resolution, standard frame rate (<=48fps).
 # H.264 values are YouTube's recommended SDR upload bitrates; H.265 is ~50% of that.
@@ -64,6 +73,33 @@ def pick_bitrate_cap(codec, height, fps):
     return cap
 
 
+def rate_vmaf(score):
+    return next(text for threshold, text in VMAF_RATINGS if score >= threshold)
+
+
+def run_vmaf(reference, distorted):
+    """Compare `distorted` against `reference` and return the pooled mean VMAF score."""
+    if not shutil.which("ffmpeg"):
+        raise ProbeError("ffmpeg not found on PATH — install ffmpeg")
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        log_path = Path(tmp.name)
+    try:
+        filter_graph = (
+            "[0:v]setpts=PTS-STARTPTS[dist];"
+            "[1:v]setpts=PTS-STARTPTS[ref];"
+            "[dist][ref]scale2ref=flags=bicubic[dist2][ref2];"
+            f"[dist2][ref2]libvmaf=log_fmt=json:log_path={log_path}"
+        )
+        cmd = ["ffmpeg", "-y", "-i", str(distorted), "-i", str(reference), "-lavfi", filter_graph, "-f", "null", "-"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise ProbeError(f"vmaf comparison failed: {result.stderr.strip()[-2000:]}")
+        data = json.loads(log_path.read_text())
+        return data["pooled_metrics"]["vmaf"]["mean"]
+    finally:
+        log_path.unlink(missing_ok=True)
+
+
 def build_command(args, target_height, fps):
     cap_kbps = pick_bitrate_cap(args.codec, target_height, fps)
     cmd = ["ffmpeg", "-y", "-i", str(args.input)]
@@ -93,6 +129,7 @@ def parse_args(argv):
     parser.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 28)")
     parser.add_argument("--preset", help="override default encoder preset (h264: slow, h265: medium)")
     parser.add_argument("--dry-run", action="store_true", help="print the ffmpeg command without running it")
+    parser.add_argument("--compare", action="store_true", help="after encoding, compute the VMAF score against the source")
     args = parser.parse_args(argv)
 
     if not args.input.exists():
@@ -124,6 +161,18 @@ def main(argv=None):
         return 0
 
     result = subprocess.run(cmd)
+    if result.returncode != 0:
+        return result.returncode
+
+    if args.compare:
+        print(f"running VMAF comparison: {args.output} vs {args.input}")
+        try:
+            score = run_vmaf(reference=args.input, distorted=args.output)
+        except ProbeError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 1
+        print(f"VMAF: {score:.2f} ({rate_vmaf(score)})")
+
     return result.returncode
 
 
