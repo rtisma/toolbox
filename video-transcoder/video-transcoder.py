@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Re-encode a video to H.265 (default) or H.264 with a sane bitrate for its resolution.
+"""Re-encode a video (or a whole directory of them) to H.265 (default) or H.264
+with a sane bitrate for its resolution.
 
 Uses CRF (quality-based) encoding rather than a fixed bitrate, capped with
 -maxrate/-bufsize so a busy scene can't balloon the file. The cap is picked
@@ -7,10 +8,17 @@ from the source's own resolution (or --height, if you're also downscaling)
 using YouTube's published upload-bitrate guidance as the H.264 baseline,
 halved for H.265 (HEVC typically matches H.264 quality at ~50% of the bits).
 
+Output files are named <basename>.converted.mp4 (myfile.mov -> myfile.converted.mp4).
+When given a directory, every video file in it is converted — set --jobs to
+control how many run at once — and a JSON report with per-file space savings
+and VMAF scores is written.
+
     python3 video-transcoder.py input.mov
     python3 video-transcoder.py input.mov --codec h264 --height 480
     python3 video-transcoder.py input.mov -o out.mp4 --crf 25 --dry-run
     python3 video-transcoder.py input.mov --no-compare
+    python3 video-transcoder.py ./videos/ --jobs 3
+    python3 video-transcoder.py ./videos/ --jobs 3 --report ./videos/report.json
 """
 
 import argparse
@@ -19,7 +27,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+VIDEO_EXTENSIONS = {
+    ".mov", ".mp4", ".m4v", ".mkv", ".avi", ".webm",
+    ".wmv", ".flv", ".mpg", ".mpeg", ".m2ts", ".ts",
+}
 
 VMAF_RATINGS = [
     (93, "near-transparent, no perceptible loss for most viewers"),
@@ -100,9 +114,29 @@ def run_vmaf(reference, distorted):
         log_path.unlink(missing_ok=True)
 
 
-def build_command(args, target_height, fps):
+def human_size(num_bytes):
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(size) < 1024:
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TB"
+
+
+def default_output_path(input_path, output_dir=None):
+    return (output_dir or input_path.parent) / f"{input_path.stem}.converted.mp4"
+
+
+def discover_videos(directory):
+    return sorted(
+        p for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS and not p.stem.endswith(".converted")
+    )
+
+
+def build_command(input_path, output_path, args, target_height, fps):
     cap_kbps = pick_bitrate_cap(args.codec, target_height, fps)
-    cmd = ["ffmpeg", "-y", "-i", str(args.input)]
+    cmd = ["ffmpeg", "-y", "-i", str(input_path)]
     if args.height:
         cmd += ["-vf", f"scale=-2:{args.height}"]
     cmd += [
@@ -116,27 +150,102 @@ def build_command(args, target_height, fps):
     ]
     if args.codec == "h265":
         cmd += ["-tag:v", "hvc1"]  # QuickTime/Apple HEVC-in-MP4 compatibility
-    cmd.append(str(args.output))
+    cmd.append(str(output_path))
     return cmd, cap_kbps
+
+
+def process_one(input_path, output_path, args):
+    """Transcode input_path -> output_path and return a result dict describing the outcome."""
+    entry = {"file": str(input_path), "output": str(output_path), "codec": args.codec, "crf": args.crf, "preset": args.preset}
+    try:
+        source_height, fps = probe_video(input_path)
+    except ProbeError as err:
+        return {**entry, "status": "error", "error": str(err)}
+
+    target_height = args.height or source_height
+    cmd, cap_kbps = build_command(input_path, output_path, args, target_height, fps)
+    entry["command"] = " ".join(cmd)
+    entry["source_height"] = source_height
+    entry["target_height"] = target_height
+    entry["maxrate_kbps"] = cap_kbps
+
+    if args.dry_run:
+        return {**entry, "status": "dry-run"}
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return {**entry, "status": "error", "error": result.stderr.strip()[-2000:]}
+
+    original_bytes = input_path.stat().st_size
+    converted_bytes = output_path.stat().st_size
+    entry.update({
+        "status": "ok",
+        "original_bytes": original_bytes,
+        "converted_bytes": converted_bytes,
+        "savings_bytes": original_bytes - converted_bytes,
+        "savings_percent": round((1 - converted_bytes / original_bytes) * 100, 2) if original_bytes else 0.0,
+    })
+
+    if args.compare:
+        try:
+            score = run_vmaf(reference=input_path, distorted=output_path)
+            entry["vmaf"] = round(score, 2)
+            entry["vmaf_rating"] = rate_vmaf(score)
+        except ProbeError as err:
+            entry["vmaf_error"] = str(err)
+
+    return entry
+
+
+def summarize_entry(entry):
+    if entry["status"] == "error":
+        return f"[error] {entry['file']}: {entry['error']}"
+    if entry["status"] == "dry-run":
+        return f"[dry-run] {entry['file']} -> {entry['output']}"
+    parts = [
+        f"[ok] {entry['file']} -> {entry['output']}",
+        f"{human_size(entry['original_bytes'])} -> {human_size(entry['converted_bytes'])} ({entry['savings_percent']:+.1f}%)",
+    ]
+    if "vmaf" in entry:
+        parts.append(f"VMAF {entry['vmaf']:.2f} ({entry['vmaf_rating']})")
+    elif "vmaf_error" in entry:
+        parts.append(f"VMAF error: {entry['vmaf_error']}")
+    return " | ".join(parts)
+
+
+def run_batch(files, args, output_dir):
+    results = []
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = {pool.submit(process_one, f, default_output_path(f, output_dir), args): f for f in files}
+        for future in as_completed(futures):
+            entry = future.result()
+            print(summarize_entry(entry))
+            results.append(entry)
+    results.sort(key=lambda e: e["file"])
+    return results
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("input", type=Path, help="source video file")
-    parser.add_argument("-o", "--output", type=Path, help="output file (default: <input>_<codec>.mp4)")
+    parser.add_argument("input", type=Path, help="source video file, or a directory of video files")
+    parser.add_argument("-o", "--output", type=Path,
+                         help="output file for a single input, or output directory for a directory input "
+                              "(default: alongside each source, named <basename>.converted.mp4)")
     parser.add_argument("-c", "--codec", choices=["h265", "h264"], default="h265")
     parser.add_argument("--height", type=int, help="downscale to this height (e.g. 480, 720); default: keep source resolution")
     parser.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 28)")
     parser.add_argument("--preset", help="override default encoder preset (h264: slow, h265: medium)")
-    parser.add_argument("--dry-run", action="store_true", help="print the ffmpeg command without running it")
+    parser.add_argument("--dry-run", action="store_true", help="print the planned ffmpeg command(s) without running them")
     parser.add_argument("--compare", action=argparse.BooleanOptionalAction, default=True,
                          help="after encoding, compute the VMAF score against the source (default: on; use --no-compare to skip)")
+    parser.add_argument("-j", "--jobs", type=int, default=4, help="number of files to convert concurrently in directory mode (default: 4)")
+    parser.add_argument("-r", "--report", type=Path, help="path for the JSON report in directory mode (default: <directory>/conversion-report.json)")
     args = parser.parse_args(argv)
 
     if not args.input.exists():
-        parser.error(f"input file not found: {args.input}")
-    if args.output is None:
-        args.output = args.input.with_name(f"{args.input.stem}_{args.codec}.mp4")
+        parser.error(f"input path not found: {args.input}")
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
     if args.crf is None:
         args.crf = DEFAULT_CRF[args.codec]
     if args.preset is None:
@@ -146,35 +255,35 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
-    try:
-        source_height, fps = probe_video(args.input)
-    except ProbeError as err:
-        print(f"error: {err}", file=sys.stderr)
-        return 1
 
-    target_height = args.height or source_height
-    cmd, cap_kbps = build_command(args, target_height, fps)
+    if args.input.is_dir():
+        files = discover_videos(args.input)
+        if not files:
+            print(f"no video files found in {args.input}")
+            return 0
 
-    print(f"source: {source_height}p @ {fps:.2f}fps -> target: {target_height}p, "
-          f"codec={args.codec}, crf={args.crf}, preset={args.preset}, maxrate={cap_kbps}k")
-    print(" ".join(cmd))
-    if args.dry_run:
-        return 0
+        output_dir = args.output or args.input
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = args.report or (args.input / "conversion-report.json")
 
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        return result.returncode
+        print(f"converting {len(files)} file(s) from {args.input} with {args.jobs} concurrent job(s)")
+        results = run_batch(files, args, output_dir)
+        report_path.write_text(json.dumps(results, indent=2))
 
-    if args.compare:
-        print(f"running VMAF comparison: {args.output} vs {args.input}")
-        try:
-            score = run_vmaf(reference=args.input, distorted=args.output)
-        except ProbeError as err:
-            print(f"error: {err}", file=sys.stderr)
-            return 1
-        print(f"VMAF: {score:.2f} ({rate_vmaf(score)})")
+        ok = [r for r in results if r["status"] == "ok"]
+        errors = [r for r in results if r["status"] == "error"]
+        total_saved = sum(r["savings_bytes"] for r in ok)
+        print(f"done: {len(ok)} converted, {len(errors)} failed, {human_size(total_saved)} saved total")
+        print(f"report written to {report_path}")
+        return 1 if errors else 0
 
-    return result.returncode
+    output_path = args.output or default_output_path(args.input)
+    entry = process_one(args.input, output_path, args)
+    print(summarize_entry(entry))
+    if args.report:
+        args.report.write_text(json.dumps([entry], indent=2))
+        print(f"report written to {args.report}")
+    return 0 if entry["status"] in ("ok", "dry-run") else 1
 
 
 if __name__ == "__main__":
