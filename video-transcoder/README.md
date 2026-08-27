@@ -4,8 +4,8 @@ Re-encode a video to H.265 (default) or H.264 with a bitrate cap sized to its
 actual resolution, instead of guessing a number. Uses CRF (quality-based)
 encoding with `-maxrate`/`-bufsize` so busy scenes can't balloon the file.
 
-Requires `ffmpeg`/`ffprobe` on `PATH`, built with `libvmaf` (for `--compare`).
-No Python dependencies beyond the standard library.
+Requires `ffmpeg`/`ffprobe` on `PATH`, built with `libvmaf` (for the VMAF
+comparison). No Python dependencies beyond the standard library.
 
 ## Usage
 
@@ -13,7 +13,7 @@ No Python dependencies beyond the standard library.
 python3 video-transcoder.py input.mov
 python3 video-transcoder.py input.mov --codec h264 --height 480
 python3 video-transcoder.py input.mov -o out.mp4 --crf 25 --dry-run
-python3 video-transcoder.py input.mov --compare
+python3 video-transcoder.py input.mov --no-compare
 ```
 
 | Flag | Default | Notes |
@@ -24,13 +24,14 @@ python3 video-transcoder.py input.mov --compare
 | `--crf` | `23` (h264) / `28` (h265) | lower = higher quality/bigger file |
 | `--preset` | `slow` (h264) / `medium` (h265) | encoder speed/efficiency tradeoff |
 | `--dry-run` | off | print the ffmpeg command without running it |
-| `--compare` | off | after encoding, score the output against the source with VMAF |
+| `--compare`/`--no-compare` | on | after encoding, score the output against the source with VMAF |
 
-`--compare` runs a VMAF (Netflix's perceptual quality metric) comparison
-between the encoded output and the original source, scaling the output back
-up to the source's resolution first if it was downscaled. VMAF is 0-100:
-`>=93` near-transparent, `>=80` good (minor loss on close inspection),
-`>=60` noticeable degradation, below that poor.
+By default, after encoding the script runs a VMAF (Netflix's perceptual
+quality metric) comparison between the output and the original source,
+scaling the output back up to the source's resolution first if it was
+downscaled. Pass `--no-compare` to skip it. VMAF is 0-100: `>=93`
+near-transparent, `>=80` good (minor loss on close inspection), `>=60`
+noticeable degradation, below that poor.
 
 The bitrate cap is picked from the target resolution using YouTube's
 published SDR upload-bitrate guidance as the H.264 baseline (2160p 45Mbps,

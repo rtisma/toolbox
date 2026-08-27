@@ -10,7 +10,7 @@ halved for H.265 (HEVC typically matches H.264 quality at ~50% of the bits).
     python3 video-transcoder.py input.mov
     python3 video-transcoder.py input.mov --codec h264 --height 480
     python3 video-transcoder.py input.mov -o out.mp4 --crf 25 --dry-run
-    python3 video-transcoder.py input.mov --compare
+    python3 video-transcoder.py input.mov --no-compare
 """
 
 import argparse
@@ -129,7 +129,8 @@ def parse_args(argv):
     parser.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 28)")
     parser.add_argument("--preset", help="override default encoder preset (h264: slow, h265: medium)")
     parser.add_argument("--dry-run", action="store_true", help="print the ffmpeg command without running it")
-    parser.add_argument("--compare", action="store_true", help="after encoding, compute the VMAF score against the source")
+    parser.add_argument("--compare", action=argparse.BooleanOptionalAction, default=True,
+                         help="after encoding, compute the VMAF score against the source (default: on; use --no-compare to skip)")
     args = parser.parse_args(argv)
 
     if not args.input.exists():
