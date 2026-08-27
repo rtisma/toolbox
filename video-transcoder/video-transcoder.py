@@ -174,6 +174,7 @@ def process_one(input_path, output_path, args):
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
+        output_path.unlink(missing_ok=True)  # drop any partial output so a re-run retries this file
         return {**entry, "status": "error", "error": result.stderr.strip()[-2000:]}
 
     original_bytes = input_path.stat().st_size
