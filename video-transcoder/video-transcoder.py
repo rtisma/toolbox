@@ -18,8 +18,9 @@ own line, stacked.
 VMAF scoring (on by default) requires ffmpeg to be built with libvmaf; this
 is checked up front, before any conversion starts, and the script exits
 with an error (not a silent skip) if it's missing — pass --no-compare to
-proceed without it. Use the "compare" subcommand to VMAF-score a file
-you've already converted, without re-running any conversion.
+proceed without it. Use "check-libvmaf" to check this directly, and
+"compare" to VMAF-score a file you've already converted, without
+re-running any conversion.
 
     python3 video-transcoder.py input.mov
     python3 video-transcoder.py input.mov --codec h264 --height 480
@@ -29,6 +30,7 @@ you've already converted, without re-running any conversion.
     python3 video-transcoder.py ./videos/ --jobs 3 --report ./videos/report.json
     python3 video-transcoder.py ./videos/ --retries 2 --slack-webhook https://hooks.slack.com/services/...
     python3 video-transcoder.py compare input.mov input.converted.mp4
+    python3 video-transcoder.py check-libvmaf
 """
 
 import argparse
@@ -582,10 +584,33 @@ def cmd_compare(argv):
     return 0
 
 
+def cmd_check_libvmaf(argv):
+    parser = argparse.ArgumentParser(
+        prog="video-transcoder.py check-libvmaf",
+        description="Check whether the ffmpeg on PATH was built with libvmaf support",
+    )
+    parser.parse_args(argv)
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        print("ffmpeg not found on PATH", file=sys.stderr)
+        return 1
+
+    if ffmpeg_has_libvmaf():
+        print(f"libvmaf: available ({ffmpeg_path})")
+        return 0
+
+    print(f"libvmaf: NOT available ({ffmpeg_path})\n"
+          "  - install a build that has it (e.g. https://github.com/BtbN/FFmpeg-Builds, the *-gpl static builds)")
+    return 1
+
+
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     if argv and argv[0] == "compare":
         return cmd_compare(argv[1:])
+    if argv and argv[0] == "check-libvmaf":
+        return cmd_check_libvmaf(argv[1:])
 
     args = parse_args(argv)
 

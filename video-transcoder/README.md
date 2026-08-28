@@ -30,6 +30,9 @@ python3 video-transcoder.py ./videos/ --retries 2 --slack-webhook https://hooks.
 
 # score a file you already converted, without converting anything
 python3 video-transcoder.py compare input.mov input.converted.mp4
+
+# check whether the ffmpeg on PATH has libvmaf support
+python3 video-transcoder.py check-libvmaf
 ```
 
 Output files are always named `<basename>.converted.mp4` unless `-o` is
@@ -134,11 +137,14 @@ status line printed every few seconds per file instead of redrawing in place.
 ## Checking for / adding libvmaf
 
 ```bash
-ffmpeg -hide_banner -filters | grep -i libvmaf
+python3 video-transcoder.py check-libvmaf
 ```
-A line of output means you have it; nothing means you don't (matching what
-the script's own up-front check does). If your ffmpeg came from a distro
-package manager, the easiest fix is usually a prebuilt static binary that
+Runs the same check the script does up front — prints whether `libvmaf` is
+available (and which `ffmpeg` on `PATH` was checked), exit code 0 if so,
+1 if not. Equivalent to `ffmpeg -hide_banner -filters | grep -i libvmaf`.
+
+If your ffmpeg came from a distro package manager, the easiest fix is
+usually a prebuilt static binary that
 already includes it, e.g. the `*-gpl` builds from
 https://github.com/BtbN/FFmpeg-Builds — copy `ffmpeg`/`ffprobe` from the
 archive somewhere earlier on `PATH` than the distro package (`/usr/local/bin`
