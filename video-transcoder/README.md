@@ -5,11 +5,13 @@ H.264 with a bitrate cap sized to its actual resolution, instead of guessing
 a number. Uses CRF (quality-based) encoding with `-maxrate`/`-bufsize` so
 busy scenes can't balloon the file.
 
-Requires `ffmpeg`/`ffprobe` on `PATH`. `libvmaf` is optional — if this
-ffmpeg build wasn't compiled with `--enable-libvmaf` (common on Linux
-distro packages), the script detects that once at startup, prints a
-warning, and disables VMAF for the whole run instead of failing per file.
-No Python dependencies beyond the standard library.
+Requires `ffmpeg`/`ffprobe` on `PATH`. `libvmaf` is required for VMAF
+scoring (on by default) — if this ffmpeg build wasn't compiled with
+`--enable-libvmaf` (common on Linux distro packages), the script checks
+once up front, before doing anything else, and **exits with an error**
+rather than converting without telling you; pass `--no-compare` to proceed
+without VMAF. See "Checking for / adding libvmaf" below. No Python
+dependencies beyond the standard library.
 
 ## Usage
 
@@ -25,6 +27,9 @@ python3 video-transcoder.py ./videos/ --jobs 3 --report ./videos/report.json
 
 # retry failures up to twice, and post a summary to Slack when done
 python3 video-transcoder.py ./videos/ --retries 2 --slack-webhook https://hooks.slack.com/services/...
+
+# score a file you already converted, without converting anything
+python3 video-transcoder.py compare input.mov input.converted.mp4
 ```
 
 Output files are always named `<basename>.converted.mp4` unless `-o` is
@@ -125,3 +130,27 @@ one-line result and removed from the stack, so the board only ever shows
 what's still running. A file being retried shows `[attempt N/M]`. When
 stdout isn't a real terminal (piped to a file/log), it falls back to a plain
 status line printed every few seconds per file instead of redrawing in place.
+
+## Checking for / adding libvmaf
+
+```bash
+ffmpeg -hide_banner -filters | grep -i libvmaf
+```
+A line of output means you have it; nothing means you don't (matching what
+the script's own up-front check does). If your ffmpeg came from a distro
+package manager, the easiest fix is usually a prebuilt static binary that
+already includes it, e.g. the `*-gpl` builds from
+https://github.com/BtbN/FFmpeg-Builds — copy `ffmpeg`/`ffprobe` from the
+archive somewhere earlier on `PATH` than the distro package (`/usr/local/bin`
+typically works). `libvmaf` is GPL-licensed, so you need a `-gpl` build, not
+`-lgpl`. Building ffmpeg from source with `--enable-libvmaf --enable-gpl` is
+the alternative if you need other custom build flags too.
+
+## Comparing an already-converted file
+
+```bash
+python3 video-transcoder.py compare original.mov original.converted.mp4
+```
+Runs just the VMAF comparison — no conversion — against two existing files
+and prints the score. Useful for checking a file converted before this
+script had VMAF support, or one converted elsewhere with the same codec.

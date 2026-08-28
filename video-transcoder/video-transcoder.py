@@ -15,6 +15,12 @@ and VMAF scores is written. Each in-flight file gets a live progress bar
 (percent/time/speed) in the terminal; concurrent conversions each get their
 own line, stacked.
 
+VMAF scoring (on by default) requires ffmpeg to be built with libvmaf; this
+is checked up front, before any conversion starts, and the script exits
+with an error (not a silent skip) if it's missing — pass --no-compare to
+proceed without it. Use the "compare" subcommand to VMAF-score a file
+you've already converted, without re-running any conversion.
+
     python3 video-transcoder.py input.mov
     python3 video-transcoder.py input.mov --codec h264 --height 480
     python3 video-transcoder.py input.mov -o out.mp4 --crf 25 --dry-run
@@ -22,6 +28,7 @@ own line, stacked.
     python3 video-transcoder.py ./videos/ --jobs 3
     python3 video-transcoder.py ./videos/ --jobs 3 --report ./videos/report.json
     python3 video-transcoder.py ./videos/ --retries 2 --slack-webhook https://hooks.slack.com/services/...
+    python3 video-transcoder.py compare input.mov input.converted.mp4
 """
 
 import argparse
@@ -544,13 +551,46 @@ def parse_args(argv):
     return args
 
 
-def main(argv=None):
-    args = parse_args(argv if argv is not None else sys.argv[1:])
+def require_libvmaf_or_exit(suggest_no_compare=True):
+    if not ffmpeg_has_libvmaf():
+        lines = ["error: this ffmpeg build lacks libvmaf, so VMAF comparison can't run."]
+        if suggest_no_compare:
+            lines.append("  - to convert without VMAF checking, add --no-compare")
+        lines.append("  - to add libvmaf support, install a build that has it "
+                      "(e.g. https://github.com/BtbN/FFmpeg-Builds, the *-gpl static builds)")
+        print("\n".join(lines), file=sys.stderr)
+        sys.exit(1)
 
-    if args.compare and not args.dry_run and not ffmpeg_has_libvmaf():
-        print("warning: this ffmpeg build lacks libvmaf — skipping VMAF comparison for this run "
-              "(rebuild ffmpeg with --enable-libvmaf, or pass --no-compare to silence this)", file=sys.stderr)
-        args.compare = False
+
+def cmd_compare(argv):
+    parser = argparse.ArgumentParser(
+        prog="video-transcoder.py compare",
+        description="Compare an already-converted file against its original and print the VMAF score",
+    )
+    parser.add_argument("original", type=Path, help="the original, unconverted source file")
+    parser.add_argument("converted", type=Path, help="the converted output file to score")
+    args = parser.parse_args(argv)
+
+    if not args.original.exists():
+        parser.error(f"original file not found: {args.original}")
+    if not args.converted.exists():
+        parser.error(f"converted file not found: {args.converted}")
+
+    require_libvmaf_or_exit(suggest_no_compare=False)
+    score = run_vmaf(reference=args.original, distorted=args.converted)
+    print(f"VMAF: {score:.2f} ({rate_vmaf(score)})")
+    return 0
+
+
+def main(argv=None):
+    argv = argv if argv is not None else sys.argv[1:]
+    if argv and argv[0] == "compare":
+        return cmd_compare(argv[1:])
+
+    args = parse_args(argv)
+
+    if args.compare:
+        require_libvmaf_or_exit()
 
     if args.input.is_dir():
         files = discover_videos(args.input)
