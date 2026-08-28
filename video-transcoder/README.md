@@ -5,8 +5,11 @@ H.264 with a bitrate cap sized to its actual resolution, instead of guessing
 a number. Uses CRF (quality-based) encoding with `-maxrate`/`-bufsize` so
 busy scenes can't balloon the file.
 
-Requires `ffmpeg`/`ffprobe` on `PATH`, built with `libvmaf` (for the VMAF
-comparison). No Python dependencies beyond the standard library.
+Requires `ffmpeg`/`ffprobe` on `PATH`. `libvmaf` is optional — if this
+ffmpeg build wasn't compiled with `--enable-libvmaf` (common on Linux
+distro packages), the script detects that once at startup, prints a
+warning, and disables VMAF for the whole run instead of failing per file.
+No Python dependencies beyond the standard library.
 
 ## Usage
 

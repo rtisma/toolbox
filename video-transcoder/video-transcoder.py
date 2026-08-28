@@ -237,10 +237,25 @@ class ProgressBoard:
             self._draw()
 
 
+_libvmaf_available = None  # lazily probed once, then cached
+
+
+def ffmpeg_has_libvmaf():
+    global _libvmaf_available
+    if _libvmaf_available is None:
+        _libvmaf_available = False
+        if shutil.which("ffmpeg"):
+            result = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True)
+            _libvmaf_available = "libvmaf" in result.stdout
+    return _libvmaf_available
+
+
 def run_vmaf(reference, distorted):
     """Compare `distorted` against `reference` and return the pooled mean VMAF score."""
     if not shutil.which("ffmpeg"):
         raise ProbeError("ffmpeg not found on PATH — install ffmpeg")
+    if not ffmpeg_has_libvmaf():
+        raise ProbeError("this ffmpeg build lacks libvmaf (rebuild with --enable-libvmaf, or pass --no-compare)")
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         log_path = Path(tmp.name)
     try:
@@ -253,7 +268,7 @@ def run_vmaf(reference, distorted):
         cmd = ["ffmpeg", "-y", "-i", str(distorted), "-i", str(reference), "-lavfi", filter_graph, "-f", "null", "-"]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise ProbeError(f"vmaf comparison failed: {result.stderr.strip()[-2000:]}")
+            raise ProbeError(f"vmaf comparison failed: {_error_tail(result.stderr, 300)}")
         data = json.loads(log_path.read_text())
         return data["pooled_metrics"]["vmaf"]["mean"]
     finally:
@@ -531,6 +546,11 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.compare and not args.dry_run and not ffmpeg_has_libvmaf():
+        print("warning: this ffmpeg build lacks libvmaf — skipping VMAF comparison for this run "
+              "(rebuild ffmpeg with --enable-libvmaf, or pass --no-compare to silence this)", file=sys.stderr)
+        args.compare = False
 
     if args.input.is_dir():
         files = discover_videos(args.input)
