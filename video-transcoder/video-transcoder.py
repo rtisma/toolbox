@@ -22,6 +22,9 @@ proceed without it. Use "check-libvmaf" to check this directly, and
 "compare" to VMAF-score a file you've already converted, without
 re-running any conversion.
 
+Three subcommands: "convert" (the default — implied if the first argument
+isn't "convert", "compare", or "check-libvmaf"), "compare", "check-libvmaf".
+
     python3 video-transcoder.py input.mov
     python3 video-transcoder.py input.mov --codec h264 --height 480
     python3 video-transcoder.py input.mov -o out.mp4 --crf 25 --dry-run
@@ -520,48 +523,67 @@ def run_batch(files, args, output_dir):
     return results
 
 
-SUBCOMMANDS_EPILOG = (
-    "subcommands (used in place of a regular conversion; run "
-    "'video-transcoder.py <subcommand> --help' for details):\n"
-    "  compare ORIGINAL CONVERTED   score an already-converted file's VMAF against its original\n"
-    "  check-libvmaf                check whether the ffmpeg on PATH has libvmaf support\n"
-)
+KNOWN_SUBCOMMANDS = {"convert", "compare", "check-libvmaf"}
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="video-transcoder.py", description=__doc__.splitlines()[0])
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    convert = subparsers.add_parser(
+        "convert", help="convert a video file or a directory of them (default when no subcommand is given)"
+    )
+    convert.add_argument("input", type=Path, help="source video file, or a directory of video files")
+    convert.add_argument("-o", "--output", type=Path,
+                          help="output file for a single input, or output directory for a directory input "
+                               "(default: alongside each source, named <basename>.converted.mp4)")
+    convert.add_argument("-c", "--codec", choices=["h265", "h264"], default="h265")
+    convert.add_argument("--height", type=int, help="downscale to this height (e.g. 480, 720); default: keep source resolution")
+    convert.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 28)")
+    convert.add_argument("--preset", help="override default encoder preset (h264: slow, h265: medium)")
+    convert.add_argument("--dry-run", action="store_true", help="print the planned ffmpeg command(s) without running them")
+    convert.add_argument("--compare", action=argparse.BooleanOptionalAction, default=True,
+                          help="after encoding, compute the VMAF score against the source (default: on; use --no-compare to skip)")
+    convert.add_argument("-j", "--jobs", type=int, default=4, help="number of files to convert concurrently in directory mode (default: 4)")
+    convert.add_argument("-r", "--report", type=Path, help="path for the JSON report in directory mode (default: <directory>/conversion-report.json)")
+    convert.add_argument("--retries", type=int, default=0, help="retry a failed conversion this many times (default: 0)")
+    convert.add_argument("--slack-webhook", default=os.environ.get("SLACK_WEBHOOK_URL"),
+                          help="Slack incoming webhook URL for a completion notification (default: $SLACK_WEBHOOK_URL)")
+
+    compare = subparsers.add_parser("compare", help="score an already-converted file's VMAF against its original")
+    compare.add_argument("original", type=Path, help="the original, unconverted source file")
+    compare.add_argument("converted", type=Path, help="the converted output file to score")
+
+    subparsers.add_parser("check-libvmaf", help="check whether the ffmpeg on PATH has libvmaf support")
+
+    return parser, convert, compare
 
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(
-        description=__doc__.splitlines()[0],
-        epilog=SUBCOMMANDS_EPILOG,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("input", type=Path, help="source video file, or a directory of video files")
-    parser.add_argument("-o", "--output", type=Path,
-                         help="output file for a single input, or output directory for a directory input "
-                              "(default: alongside each source, named <basename>.converted.mp4)")
-    parser.add_argument("-c", "--codec", choices=["h265", "h264"], default="h265")
-    parser.add_argument("--height", type=int, help="downscale to this height (e.g. 480, 720); default: keep source resolution")
-    parser.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 28)")
-    parser.add_argument("--preset", help="override default encoder preset (h264: slow, h265: medium)")
-    parser.add_argument("--dry-run", action="store_true", help="print the planned ffmpeg command(s) without running them")
-    parser.add_argument("--compare", action=argparse.BooleanOptionalAction, default=True,
-                         help="after encoding, compute the VMAF score against the source (default: on; use --no-compare to skip)")
-    parser.add_argument("-j", "--jobs", type=int, default=4, help="number of files to convert concurrently in directory mode (default: 4)")
-    parser.add_argument("-r", "--report", type=Path, help="path for the JSON report in directory mode (default: <directory>/conversion-report.json)")
-    parser.add_argument("--retries", type=int, default=0, help="retry a failed conversion this many times (default: 0)")
-    parser.add_argument("--slack-webhook", default=os.environ.get("SLACK_WEBHOOK_URL"),
-                         help="Slack incoming webhook URL for a completion notification (default: $SLACK_WEBHOOK_URL)")
+    # bare `video-transcoder.py input.mov ...` (no subcommand) implicitly means `convert`
+    if not argv or (argv[0] not in KNOWN_SUBCOMMANDS and argv[0] not in ("-h", "--help")):
+        argv = ["convert", *argv]
+
+    parser, convert, compare = build_parser()
     args = parser.parse_args(argv)
 
-    if not args.input.exists():
-        parser.error(f"input path not found: {args.input}")
-    if args.jobs < 1:
-        parser.error("--jobs must be >= 1")
-    if args.retries < 0:
-        parser.error("--retries must be >= 0")
-    if args.crf is None:
-        args.crf = DEFAULT_CRF[args.codec]
-    if args.preset is None:
-        args.preset = DEFAULT_PRESET[args.codec]
+    if args.subcommand == "convert":
+        if not args.input.exists():
+            convert.error(f"input path not found: {args.input}")
+        if args.jobs < 1:
+            convert.error("--jobs must be >= 1")
+        if args.retries < 0:
+            convert.error("--retries must be >= 0")
+        if args.crf is None:
+            args.crf = DEFAULT_CRF[args.codec]
+        if args.preset is None:
+            args.preset = DEFAULT_PRESET[args.codec]
+    elif args.subcommand == "compare":
+        if not args.original.exists():
+            compare.error(f"original file not found: {args.original}")
+        if not args.converted.exists():
+            compare.error(f"converted file not found: {args.converted}")
+
     return args
 
 
@@ -576,33 +598,14 @@ def require_libvmaf_or_exit(suggest_no_compare=True):
         sys.exit(1)
 
 
-def cmd_compare(argv):
-    parser = argparse.ArgumentParser(
-        prog="video-transcoder.py compare",
-        description="Compare an already-converted file against its original and print the VMAF score",
-    )
-    parser.add_argument("original", type=Path, help="the original, unconverted source file")
-    parser.add_argument("converted", type=Path, help="the converted output file to score")
-    args = parser.parse_args(argv)
-
-    if not args.original.exists():
-        parser.error(f"original file not found: {args.original}")
-    if not args.converted.exists():
-        parser.error(f"converted file not found: {args.converted}")
-
+def run_compare(args):
     require_libvmaf_or_exit(suggest_no_compare=False)
     score = run_vmaf(reference=args.original, distorted=args.converted)
     print(f"VMAF: {score:.2f} ({rate_vmaf(score)})")
     return 0
 
 
-def cmd_check_libvmaf(argv):
-    parser = argparse.ArgumentParser(
-        prog="video-transcoder.py check-libvmaf",
-        description="Check whether the ffmpeg on PATH was built with libvmaf support",
-    )
-    parser.parse_args(argv)
-
+def run_check_libvmaf():
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
         print("ffmpeg not found on PATH", file=sys.stderr)
@@ -618,13 +621,12 @@ def cmd_check_libvmaf(argv):
 
 
 def main(argv=None):
-    argv = argv if argv is not None else sys.argv[1:]
-    if argv and argv[0] == "compare":
-        return cmd_compare(argv[1:])
-    if argv and argv[0] == "check-libvmaf":
-        return cmd_check_libvmaf(argv[1:])
+    args = parse_args(argv if argv is not None else sys.argv[1:])
 
-    args = parse_args(argv)
+    if args.subcommand == "compare":
+        return run_compare(args)
+    if args.subcommand == "check-libvmaf":
+        return run_check_libvmaf()
 
     if args.compare:
         require_libvmaf_or_exit()

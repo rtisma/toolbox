@@ -35,6 +35,14 @@ python3 video-transcoder.py compare input.mov input.converted.mp4
 python3 video-transcoder.py check-libvmaf
 ```
 
+Three subcommands: `convert` (conversion — the default, so `video-transcoder.py input.mov` is short for
+`video-transcoder.py convert input.mov`), `compare`, and `check-libvmaf`. Run
+`video-transcoder.py --help` to see all three, or `video-transcoder.py <subcommand> --help` for a
+subcommand's own flags. The one edge case: if you have a file or directory literally named `convert`,
+`compare`, or `check-libvmaf` in the current directory, you'll need the explicit form
+(`video-transcoder.py convert ./compare`) since the bare form treats a first argument matching a
+subcommand name as that subcommand.
+
 Output files are always named `<basename>.converted.mp4` unless `-o` is
 given — `myfile.mov` becomes `myfile.converted.mp4`.
 
