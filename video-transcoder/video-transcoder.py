@@ -11,7 +11,9 @@ halved for H.265 (HEVC typically matches H.264 quality at ~50% of the bits).
 Output files are named <basename>.converted.mp4 (myfile.mov -> myfile.converted.mp4).
 When given a directory, every video file in it is converted — set --jobs to
 control how many run at once — and a JSON report with per-file space savings
-and VMAF scores is written.
+and VMAF scores is written. Each in-flight file gets a live progress bar
+(percent/time/speed) in the terminal; concurrent conversions each get their
+own line, stacked.
 
     python3 video-transcoder.py input.mov
     python3 video-transcoder.py input.mov --codec h264 --height 480
@@ -29,10 +31,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+PROGRESS_FIELDS = {
+    "frame", "fps", "bitrate", "total_size", "out_time_us", "out_time_ms",
+    "out_time", "dup_frames", "drop_frames", "speed", "progress",
+}
 
 VIDEO_EXTENSIONS = {
     ".mov", ".mp4", ".m4v", ".mkv", ".avi", ".webm",
@@ -67,19 +76,24 @@ def probe_video(path):
         raise ProbeError("ffprobe not found on PATH — install ffmpeg")
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,avg_frame_rate",
+        "-show_entries", "stream=width,height,avg_frame_rate:format=duration",
         "-of", "json", str(path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise ProbeError(f"ffprobe failed: {result.stderr.strip()}")
-    streams = json.loads(result.stdout).get("streams") or []
+    data = json.loads(result.stdout)
+    streams = data.get("streams") or []
     if not streams:
         raise ProbeError(f"no video stream found in {path}")
     stream = streams[0]
     num, _, den = stream["avg_frame_rate"].partition("/")
     fps = float(num) / float(den) if den and float(den) != 0 else float(num)
-    return int(stream["height"]), fps
+    try:
+        duration = float(data.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
+        duration = None
+    return int(stream["height"]), fps, duration
 
 
 def pick_bitrate_cap(codec, height, fps):
@@ -93,6 +107,120 @@ def pick_bitrate_cap(codec, height, fps):
 
 def rate_vmaf(score):
     return next(text for threshold, text in VMAF_RATINGS if score >= threshold)
+
+
+def format_time(seconds):
+    if seconds is None:
+        return "?:??:??"
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}"
+
+
+def render_bar(pct, width=24):
+    filled = int(width * min(max(pct, 0.0), 100.0) / 100)
+    return "#" * filled + "-" * (width - filled)
+
+
+def format_progress_line(name, pct, elapsed, duration, speed):
+    label = f"{name:<24.24}"
+    if pct is not None:
+        return f"{label} [{render_bar(pct)}] {pct:5.1f}% {format_time(elapsed)}/{format_time(duration)} {speed}x"
+    return f"{label} {format_time(elapsed)} elapsed {speed}x"
+
+
+def _parse_ffmpeg_time(value):
+    if not value:
+        return None
+    try:
+        hours, minutes, secs = value.split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(secs)
+    except ValueError:
+        return None
+
+
+def run_ffmpeg_with_progress(cmd, duration, on_tick=None):
+    """Run an ffmpeg command built with -progress pipe:1 -nostats, calling
+    on_tick(pct, elapsed, speed) as each progress block arrives (pct is None
+    if duration is unknown). Returns (returncode, log_text) where log_text is
+    everything ffmpeg printed that wasn't a progress key=value line."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    log_lines = []
+    snapshot = {}
+    for raw_line in proc.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        key, sep, value = line.partition("=")
+        if sep and key in PROGRESS_FIELDS:
+            snapshot[key] = value
+            if key == "progress":
+                if on_tick:
+                    elapsed = _parse_ffmpeg_time(snapshot.get("out_time")) or 0.0
+                    speed = snapshot.get("speed", "0x").rstrip("x") or "0"
+                    pct = min(100.0, elapsed / duration * 100) if duration else None
+                    on_tick(pct, elapsed, speed)
+                snapshot = {}
+        else:
+            log_lines.append(line)
+    proc.wait()
+    return proc.returncode, "\n".join(log_lines)
+
+
+class ProgressBoard:
+    """Renders one live-updating progress bar per in-flight file (multiple bars
+    stack via ANSI cursor moves when several conversions run concurrently).
+    Falls back to periodic plain-text lines when stdout isn't a terminal."""
+
+    def __init__(self):
+        self.interactive = sys.stdout.isatty()
+        self.lock = threading.Lock()
+        self.order = []
+        self.lines = {}
+        self.drawn = 0
+        self._last_plain = {}
+
+    def _erase(self):
+        if self.drawn:
+            sys.stdout.write(f"\x1b[{self.drawn}A")
+            for _ in range(self.drawn):
+                sys.stdout.write("\x1b[2K\n")
+            sys.stdout.write(f"\x1b[{self.drawn}A")
+        self.drawn = 0
+
+    def _draw(self):
+        for key in self.order:
+            sys.stdout.write("\x1b[2K" + self.lines[key] + "\n")
+        sys.stdout.flush()
+        self.drawn = len(self.order)
+
+    def update(self, key, text):
+        with self.lock:
+            if not self.interactive:
+                now = time.monotonic()
+                if now - self._last_plain.get(key, 0.0) < 3.0:
+                    return
+                self._last_plain[key] = now
+                print(text)
+                return
+            if key not in self.lines:
+                self.order.append(key)
+            self.lines[key] = text
+            self._erase()
+            self._draw()
+
+    def finish(self, key, final_line):
+        with self.lock:
+            if not self.interactive:
+                print(final_line)
+                return
+            self._erase()
+            if key in self.lines:
+                self.order.remove(key)
+                del self.lines[key]
+            sys.stdout.write(final_line + "\n")
+            self._draw()
 
 
 def run_vmaf(reference, distorted):
@@ -154,15 +282,17 @@ def build_command(input_path, output_path, args, target_height, fps):
     ]
     if args.codec == "h265":
         cmd += ["-tag:v", "hvc1"]  # QuickTime/Apple HEVC-in-MP4 compatibility
+    cmd += ["-progress", "pipe:1", "-nostats"]
     cmd.append(str(output_path))
     return cmd, cap_kbps
 
 
-def process_one(input_path, output_path, args):
-    """Transcode input_path -> output_path and return a result dict describing the outcome."""
+def process_one(input_path, output_path, args, report=None):
+    """Transcode input_path -> output_path and return a result dict describing the outcome.
+    If given, report(text) is called with a live-updating status line for this file."""
     entry = {"file": str(input_path), "output": str(output_path), "codec": args.codec, "crf": args.crf, "preset": args.preset}
     try:
-        source_height, fps = probe_video(input_path)
+        source_height, fps, duration = probe_video(input_path)
     except ProbeError as err:
         return {**entry, "status": "error", "error": str(err)}
 
@@ -180,15 +310,24 @@ def process_one(input_path, output_path, args):
         return dry_entry
 
     max_attempts = args.retries + 1
+    log_text = ""
     for attempt in range(1, max_attempts + 1):
-        if attempt > 1:
-            print(f"retrying {input_path} (attempt {attempt}/{max_attempts})")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
+        if attempt > 1 and report:
+            report(f"{input_path.name:<24.24} retrying (attempt {attempt}/{max_attempts})...")
+
+        def on_tick(pct, elapsed, speed, _attempt=attempt):
+            if report:
+                line = format_progress_line(input_path.name, pct, elapsed, duration, speed)
+                if max_attempts > 1:
+                    line += f"  [attempt {_attempt}/{max_attempts}]"
+                report(line)
+
+        returncode, log_text = run_ffmpeg_with_progress(cmd, duration, on_tick if report else None)
+        if returncode == 0:
             break
         output_path.unlink(missing_ok=True)  # drop any partial output so a re-run retries this file
         if attempt == max_attempts:
-            return {**entry, "status": "error", "error": result.stderr.strip()[-2000:], "attempts": attempt}
+            return {**entry, "status": "error", "error": log_text.strip()[-2000:], "attempts": attempt}
     entry["attempts"] = attempt
 
     original_bytes = input_path.stat().st_size
@@ -202,6 +341,8 @@ def process_one(input_path, output_path, args):
     })
 
     if args.compare:
+        if report:
+            report(f"{input_path.name:<24.24} computing VMAF...")
         try:
             score = run_vmaf(reference=input_path, distorted=output_path)
             entry["vmaf"] = round(score, 2)
@@ -215,7 +356,7 @@ def process_one(input_path, output_path, args):
 def summarize_entry(entry):
     if entry["status"] == "error":
         attempts_note = f" (failed after {entry['attempts']} attempts)" if entry.get("attempts", 1) > 1 else ""
-        return f"[error] {entry['file']}: {entry['error']}{attempts_note}"
+        return f"[error] {entry['file']}: {_error_tail(entry['error'], 300)}{attempts_note}"
     if entry["status"] == "dry-run":
         line = f"[dry-run] {entry['file']} -> {entry['output']}"
         if entry.get("retry_policy"):
@@ -324,13 +465,19 @@ def notify_slack(webhook_url, message):
 
 
 def run_batch(files, args, output_dir):
+    board = ProgressBoard()
+
+    def task(f):
+        key = str(f)
+        entry = process_one(f, default_output_path(f, output_dir), args, report=lambda text: board.update(key, text))
+        board.finish(key, summarize_entry(entry))
+        return entry
+
     results = []
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(process_one, f, default_output_path(f, output_dir), args): f for f in files}
+        futures = [pool.submit(task, f) for f in files]
         for future in as_completed(futures):
-            entry = future.result()
-            print(summarize_entry(entry))
-            results.append(entry)
+            results.append(future.result())
     results.sort(key=lambda e: e["file"])
     return results
 
@@ -401,8 +548,10 @@ def main(argv=None):
         return 1 if errors else 0
 
     output_path = args.output or default_output_path(args.input)
-    entry = process_one(args.input, output_path, args)
-    print(summarize_entry(entry))
+    board = ProgressBoard()
+    key = str(args.input)
+    entry = process_one(args.input, output_path, args, report=lambda text: board.update(key, text))
+    board.finish(key, summarize_entry(entry))
     if args.report:
         args.report.write_text(json.dumps([entry], indent=2))
         print(f"report written to {args.report}")

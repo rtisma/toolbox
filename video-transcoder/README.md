@@ -104,3 +104,20 @@ published SDR upload-bitrate guidance as the H.264 baseline (2160p 45Mbps,
 1440p 16Mbps, 1080p 8Mbps, 720p 5Mbps, 480p 2.5Mbps, 360p 1Mbps, 240p
 500kbps), halved for H.265 since HEVC typically matches H.264 quality at
 ~50% of the bitrate. Caps are bumped 1.5x above 48fps.
+
+## Live progress
+
+Each in-flight file gets its own progress bar in the terminal, driven by
+ffmpeg's `-progress` output (percent, elapsed/total time, encode speed):
+
+```
+clip1.mov                [###############---------]  62.9% 0:00:05/0:00:08 10.3x
+clip2.mov                [#######################-]  99.2% 0:00:07/0:00:08 11.3x
+```
+
+Concurrent conversions (`--jobs > 1`) each get their own stacked line that
+updates in place; as a file finishes, its bar is replaced by its final
+one-line result and removed from the stack, so the board only ever shows
+what's still running. A file being retried shows `[attempt N/M]`. When
+stdout isn't a real terminal (piped to a file/log), it falls back to a plain
+status line printed every few seconds per file instead of redrawing in place.
