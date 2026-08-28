@@ -142,6 +142,11 @@ what's still running. A file being retried shows `[attempt N/M]`. When
 stdout isn't a real terminal (piped to a file/log), it falls back to a plain
 status line printed every few seconds per file instead of redrawing in place.
 
+The VMAF pass gets the same live bar, tagged `[vmaf]` so you can tell it
+apart from encoding — and the standalone `compare` subcommand shows one too,
+since a VMAF comparison on a large file can take a while with otherwise zero
+output (it's decoding both videos frame-by-frame under the hood).
+
 ## Checking for / adding libvmaf
 
 ```bash

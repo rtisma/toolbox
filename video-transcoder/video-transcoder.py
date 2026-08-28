@@ -262,8 +262,10 @@ def ffmpeg_has_libvmaf():
     return _libvmaf_available
 
 
-def run_vmaf(reference, distorted):
-    """Compare `distorted` against `reference` and return the pooled mean VMAF score."""
+def run_vmaf(reference, distorted, duration=None, on_tick=None):
+    """Compare `distorted` against `reference` and return the pooled mean VMAF score.
+    If given, on_tick(pct, elapsed, speed) is called as ffmpeg reports progress
+    (pct is None if duration is unknown)."""
     if not shutil.which("ffmpeg"):
         raise ProbeError("ffmpeg not found on PATH — install ffmpeg")
     if not ffmpeg_has_libvmaf():
@@ -277,10 +279,11 @@ def run_vmaf(reference, distorted):
             "[dist][ref]scale2ref=flags=bicubic[dist2][ref2];"
             f"[dist2][ref2]libvmaf=log_fmt=json:log_path={log_path}"
         )
-        cmd = ["ffmpeg", "-y", "-i", str(distorted), "-i", str(reference), "-lavfi", filter_graph, "-f", "null", "-"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise ProbeError(f"vmaf comparison failed: {_error_tail(result.stderr, 300)}")
+        cmd = ["ffmpeg", "-y", "-i", str(distorted), "-i", str(reference), "-lavfi", filter_graph,
+               "-progress", "pipe:1", "-nostats", "-f", "null", "-"]
+        returncode, log_text = run_ffmpeg_with_progress(cmd, duration, on_tick)
+        if returncode != 0:
+            raise ProbeError(f"vmaf comparison failed: {_error_tail(log_text, 300)}")
         data = json.loads(log_path.read_text())
         return data["pooled_metrics"]["vmaf"]["mean"]
     finally:
@@ -382,10 +385,13 @@ def process_one(input_path, output_path, args, report=None):
     })
 
     if args.compare:
-        if report:
-            report(f"{input_path.name:<24.24} computing VMAF...")
+        def on_vmaf_tick(pct, elapsed, speed):
+            if report:
+                report(format_progress_line(input_path.name, pct, elapsed, duration, speed) + "  [vmaf]")
+
         try:
-            score = run_vmaf(reference=input_path, distorted=output_path)
+            score = run_vmaf(reference=input_path, distorted=output_path, duration=duration,
+                              on_tick=on_vmaf_tick if report else None)
             entry["vmaf"] = round(score, 2)
             entry["vmaf_rating"] = rate_vmaf(score)
         except ProbeError as err:
@@ -600,8 +606,19 @@ def require_libvmaf_or_exit(suggest_no_compare=True):
 
 def run_compare(args):
     require_libvmaf_or_exit(suggest_no_compare=False)
-    score = run_vmaf(reference=args.original, distorted=args.converted)
-    print(f"VMAF: {score:.2f} ({rate_vmaf(score)})")
+    board = ProgressBoard()
+    key = str(args.converted)
+    try:
+        _, _, duration = probe_video(args.original)
+
+        def on_tick(pct, elapsed, speed):
+            board.update(key, format_progress_line(args.converted.name, pct, elapsed, duration, speed))
+
+        score = run_vmaf(reference=args.original, distorted=args.converted, duration=duration, on_tick=on_tick)
+    except ProbeError as err:
+        board.finish(key, f"error: {err}")
+        return 1
+    board.finish(key, f"VMAF: {score:.2f} ({rate_vmaf(score)})")
     return 0
 
 
