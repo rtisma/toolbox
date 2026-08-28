@@ -108,11 +108,12 @@ published SDR upload-bitrate guidance as the H.264 baseline (2160p 45Mbps,
 ## Live progress
 
 Each in-flight file gets its own progress bar in the terminal, driven by
-ffmpeg's `-progress` output (percent, elapsed/total time, encode speed):
+ffmpeg's `-progress` output (percent, elapsed/total time, encode speed, and
+an ETA derived from remaining source duration ÷ current speed):
 
 ```
-clip1.mov                [###############---------]  62.9% 0:00:05/0:00:08 10.3x
-clip2.mov                [#######################-]  99.2% 0:00:07/0:00:08 11.3x
+clip1.mov                [###############---------]  62.9% 0:00:05/0:00:08 10.3x ETA 0:00:00
+clip2.mov                [#######################-]  99.2% 0:00:07/0:00:08 11.3x ETA 0:00:00
 ```
 
 Concurrent conversions (`--jobs > 1`) each get their own stacked line that

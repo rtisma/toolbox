@@ -123,10 +123,24 @@ def render_bar(pct, width=24):
     return "#" * filled + "-" * (width - filled)
 
 
+def estimate_eta(elapsed, duration, speed):
+    if duration is None or elapsed is None:
+        return None
+    try:
+        speed_val = float(speed)
+    except (TypeError, ValueError):
+        return None
+    if speed_val <= 0:
+        return None
+    return max(0.0, duration - elapsed) / speed_val
+
+
 def format_progress_line(name, pct, elapsed, duration, speed):
     label = f"{name:<24.24}"
     if pct is not None:
-        return f"{label} [{render_bar(pct)}] {pct:5.1f}% {format_time(elapsed)}/{format_time(duration)} {speed}x"
+        eta = estimate_eta(elapsed, duration, speed)
+        return (f"{label} [{render_bar(pct)}] {pct:5.1f}% "
+                f"{format_time(elapsed)}/{format_time(duration)} {speed}x ETA {format_time(eta)}")
     return f"{label} {format_time(elapsed)} elapsed {speed}x"
 
 
