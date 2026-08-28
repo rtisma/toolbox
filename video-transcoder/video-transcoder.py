@@ -520,8 +520,20 @@ def run_batch(files, args, output_dir):
     return results
 
 
+SUBCOMMANDS_EPILOG = (
+    "subcommands (used in place of a regular conversion; run "
+    "'video-transcoder.py <subcommand> --help' for details):\n"
+    "  compare ORIGINAL CONVERTED   score an already-converted file's VMAF against its original\n"
+    "  check-libvmaf                check whether the ffmpeg on PATH has libvmaf support\n"
+)
+
+
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        epilog=SUBCOMMANDS_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("input", type=Path, help="source video file, or a directory of video files")
     parser.add_argument("-o", "--output", type=Path,
                          help="output file for a single input, or output directory for a directory input "
