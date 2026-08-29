@@ -3,10 +3,12 @@
 with a sane bitrate for its resolution.
 
 Uses CRF (quality-based) encoding rather than a fixed bitrate, capped with
--maxrate/-bufsize so a busy scene can't balloon the file. The cap is picked
-from the source's own resolution (or --height, if you're also downscaling)
-using YouTube's published upload-bitrate guidance as the H.264 baseline,
-halved for H.265 (HEVC typically matches H.264 quality at ~50% of the bits).
+-maxrate/-bufsize as a safety ceiling (not a target) so a busy scene can't
+balloon the file. The cap is picked from the source's own resolution (or
+--height, if you're also downscaling): H.264 uses YouTube's published
+upload-bitrate guidance directly (a size-conscious ceiling); H.265's cap
+is set generously (~3.5x H.264/2) so it only binds on genuinely pathological
+content, since CRF -- not the cap -- should be doing the quality work.
 
 Output files are named <basename>.converted.mp4 (myfile.mov -> myfile.converted.mp4).
 When given a directory, every video file in it is converted — set --jobs to
@@ -69,14 +71,21 @@ VMAF_RATINGS = [
 ]
 
 # kbps caps, keyed by vertical resolution, standard frame rate (<=48fps).
-# H.264 values are YouTube's recommended SDR upload bitrates; H.265 is ~50% of that.
+# H.264 values are YouTube's recommended SDR upload bitrates -- a size-conscious ceiling
+# tuned for typical, already-fairly-clean streaming source. H.265 values are a generous
+# (~3.5x H.264/2) safety ceiling, not a target: with CRF-based encoding, this should only
+# ever bind on genuinely pathological content (heavy grain/noise, extreme motion), not
+# routinely clip the bitrate CRF actually wants. A cap that binds routinely is a bug --
+# it silently overrides the CRF quality target, which is what drove VMAF scores as low
+# as 50-60 on complex/grainy source (e.g. old camcorder footage) before this was raised.
 BITRATE_KBPS = {
     "h264": {2160: 45000, 1440: 16000, 1080: 8000, 720: 5000, 480: 2500, 360: 1000, 240: 500},
-    "h265": {2160: 22000, 1440: 8000, 1080: 4000, 720: 2500, 480: 1200, 360: 600, 240: 300},
+    "h265": {2160: 80000, 1440: 30000, 1080: 16000, 720: 8000, 480: 4000, 360: 2000, 240: 1000},
 }
 HIGH_FPS_MULTIPLIER = 1.5  # applied above 48fps
-DEFAULT_CRF = {"h264": 23, "h265": 28}
-DEFAULT_PRESET = {"h264": "slow", "h265": "medium"}
+DEFAULT_CRF = {"h264": 23, "h265": 20}  # h265: lower than h264's 23 -- x265's CRF scale runs
+                                          # a few points "harsher" than x264's at the same number
+DEFAULT_PRESET = {"h264": "slow", "h265": "slow"}
 ENCODER = {"h264": "libx264", "h265": "libx265"}
 
 
@@ -601,8 +610,8 @@ def build_parser():
                                "(default: alongside each source, named <basename>.converted.mp4)")
     convert.add_argument("-c", "--codec", choices=["h265", "h264"], default="h265")
     convert.add_argument("--height", type=int, help="downscale to this height (e.g. 480, 720); default: keep source resolution")
-    convert.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 28)")
-    convert.add_argument("--preset", help="override default encoder preset (h264: slow, h265: medium)")
+    convert.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 20)")
+    convert.add_argument("--preset", help="override default encoder preset (h264: slow, h265: slow)")
     convert.add_argument("--dry-run", action="store_true", help="print the planned ffmpeg command(s) without running them")
     convert.add_argument("--compare", action=argparse.BooleanOptionalAction, default=True,
                           help="after encoding, compute the VMAF score against the source (default: on; use --no-compare to skip)")

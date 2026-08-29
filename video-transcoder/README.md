@@ -54,8 +54,8 @@ given — `myfile.mov` becomes `myfile.converted.mp4`.
 | `-o/--output` | alongside source, `<basename>.converted.mp4` | single input: output file path; directory input: output directory |
 | `-c/--codec` | `h265` | `h265` or `h264` |
 | `--height` | source height | downscale (e.g. `720`, `480`, `360`) |
-| `--crf` | `23` (h264) / `28` (h265) | lower = higher quality/bigger file |
-| `--preset` | `slow` (h264) / `medium` (h265) | encoder speed/efficiency tradeoff |
+| `--crf` | `23` (h264) / `20` (h265) | lower = higher quality/bigger file |
+| `--preset` | `slow` (h264) / `slow` (h265) | encoder speed/efficiency tradeoff |
 | `--dry-run` | off | print the planned ffmpeg command(s) without running them |
 | `--compare`/`--no-compare` | on | after encoding, score the output against the source with VMAF |
 | `-j/--jobs` | `4` | directory mode: how many files to convert concurrently |
@@ -122,11 +122,18 @@ lists what *would* be converted instead of real results:
 • `clip3.mov` → `clip3.converted.mp4`
 ```
 
-The bitrate cap is picked from the target resolution using YouTube's
-published SDR upload-bitrate guidance as the H.264 baseline (2160p 45Mbps,
+The `-maxrate`/`-bufsize` cap is a safety ceiling, not a target — CRF does
+the actual quality work. It's picked from the target resolution: H.264 uses
+YouTube's published SDR upload-bitrate guidance directly (2160p 45Mbps,
 1440p 16Mbps, 1080p 8Mbps, 720p 5Mbps, 480p 2.5Mbps, 360p 1Mbps, 240p
-500kbps), halved for H.265 since HEVC typically matches H.264 quality at
-~50% of the bitrate. Caps are bumped 1.5x above 48fps.
+500kbps) — a size-conscious ceiling, appropriate since H.264's default CRF
+(23) is already a fairly efficient setting. H.265's cap is set far more
+generously (2160p 80Mbps, 1440p 30Mbps, 1080p 16Mbps, 720p 8Mbps, 480p
+4Mbps, 360p 2Mbps, 240p 1Mbps) so it only binds on genuinely pathological
+content (heavy grain/noise, extreme motion) rather than routinely
+overriding the CRF quality target — a cap that binds routinely on ordinary
+complex content (e.g. old camcorder footage) is what drove VMAF scores as
+low as 50-60 before this was raised. Caps are bumped 1.5x above 48fps.
 
 ## Live progress
 
