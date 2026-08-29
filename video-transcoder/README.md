@@ -33,6 +33,9 @@ python3 video-transcoder.py compare input.mov input.converted.mp4
 
 # check whether the ffmpeg on PATH has libvmaf support
 python3 video-transcoder.py check-libvmaf
+
+# source is on an NFS mount: read from there, write output to local disk
+python3 video-transcoder.py /mnt/nfs/videos/clip.mov --nfs
 ```
 
 Three subcommands: `convert` (conversion — the default, so `video-transcoder.py input.mov` is short for
@@ -59,6 +62,7 @@ given — `myfile.mov` becomes `myfile.converted.mp4`.
 | `-r/--report` | `<directory>/conversion-report.json` | directory mode: where to write the JSON report |
 | `--retries` | `0` | retry a failed conversion this many times before giving up |
 | `--slack-webhook` | `$SLACK_WEBHOOK_URL` | if set, post a completion summary to this Slack incoming webhook |
+| `--nfs` | off | read from the source but write output to local disk instead (see "Reading from NFS" below) |
 
 By default, after encoding the script runs a VMAF (Netflix's perceptual
 quality metric) comparison between the output and the original source,
@@ -146,6 +150,33 @@ The VMAF pass gets the same live bar, tagged `[vmaf]` so you can tell it
 apart from encoding — and the standalone `compare` subcommand shows one too,
 since a VMAF comparison on a large file can take a while with otherwise zero
 output (it's decoding both videos frame-by-frame under the hood).
+
+## Reading from NFS
+
+```bash
+python3 video-transcoder.py /mnt/nfs/videos/clip.mov --nfs
+python3 video-transcoder.py /mnt/nfs/videos/ --nfs --jobs 4
+python3 video-transcoder.py /mnt/nfs/videos/clip.mov --nfs -o /scratch/clip.converted.mp4
+```
+
+`--nfs` reads the source from wherever it is (NFS or otherwise) but writes
+the converted output to local disk instead of alongside the source —
+useful because writing (especially the `-movflags +faststart` rewrite at
+the end of encoding) is much slower and less reliable over NFS than local
+disk. Without `-o`, output goes to a shared local temp directory
+(`$TMPDIR/video-transcoder`, e.g. `/tmp/video-transcoder`); `-o` overrides
+this the same way it does normally (output file for a single input, output
+directory for a directory input).
+
+Before writing, it checks free space on the destination filesystem against
+the source file's size (a safe upper bound, since converted output is
+almost always smaller) and fails that file with a clear error — no ffmpeg
+run, no partial file — if there isn't enough room, rather than running out
+of disk mid-encode. In directory mode with `--jobs > 1`, this check runs
+independently per file right before it starts, so it's a best-effort
+guard, not a hard reservation — concurrent files could in principle pass
+the check around the same moment and still add up to more than what's
+free.
 
 ## Checking for / adding libvmaf
 

@@ -34,6 +34,7 @@ isn't "convert", "compare", or "check-libvmaf"), "compare", "check-libvmaf".
     python3 video-transcoder.py ./videos/ --retries 2 --slack-webhook https://hooks.slack.com/services/...
     python3 video-transcoder.py compare input.mov input.converted.mp4
     python3 video-transcoder.py check-libvmaf
+    python3 video-transcoder.py /mnt/nfs/videos/clip.mov --nfs
 """
 
 import argparse
@@ -81,6 +82,23 @@ ENCODER = {"h264": "libx264", "h265": "libx265"}
 
 class ProbeError(RuntimeError):
     pass
+
+
+class DiskSpaceError(RuntimeError):
+    pass
+
+
+NFS_LOCAL_DIR = Path(tempfile.gettempdir()) / "video-transcoder"
+
+
+def check_disk_space(output_dir, required_bytes):
+    existing = next((p for p in (output_dir, *output_dir.parents) if p.exists()), Path(output_dir.anchor or "/"))
+    free = shutil.disk_usage(existing).free
+    if free < required_bytes:
+        raise DiskSpaceError(
+            f"not enough free space for {output_dir}: {human_size(free)} free, "
+            f"need at least {human_size(required_bytes)} (source file size)"
+        )
 
 
 def probe_video(path):
@@ -347,11 +365,21 @@ def process_one(input_path, output_path, args, report=None):
     entry["target_height"] = target_height
     entry["maxrate_kbps"] = cap_kbps
 
+    if args.nfs:
+        try:
+            check_disk_space(output_path.parent, input_path.stat().st_size)
+        except DiskSpaceError as err:
+            return {**entry, "status": "error", "error": str(err)}
+
     if args.dry_run:
         dry_entry = {**entry, "status": "dry-run"}
         if args.retries:
             dry_entry["retry_policy"] = f"would retry up to {args.retries} time(s) on failure"
+        if args.nfs:
+            dry_entry["nfs_note"] = f"would read from NFS, write locally to {output_path.parent}"
         return dry_entry
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     max_attempts = args.retries + 1
     log_text = ""
@@ -406,8 +434,9 @@ def summarize_entry(entry):
         return f"[error] {entry['file']}: {_error_tail(entry['error'], 300)}{attempts_note}"
     if entry["status"] == "dry-run":
         line = f"[dry-run] {entry['file']} -> {entry['output']}"
-        if entry.get("retry_policy"):
-            line += f" ({entry['retry_policy']})"
+        notes = [n for n in (entry.get("retry_policy"), entry.get("nfs_note")) if n]
+        if notes:
+            line += f" ({'; '.join(notes)})"
         return line
     parts = [
         f"[ok] {entry['file']} -> {entry['output']}",
@@ -555,6 +584,10 @@ def build_parser():
     convert.add_argument("--retries", type=int, default=0, help="retry a failed conversion this many times (default: 0)")
     convert.add_argument("--slack-webhook", default=os.environ.get("SLACK_WEBHOOK_URL"),
                           help="Slack incoming webhook URL for a completion notification (default: $SLACK_WEBHOOK_URL)")
+    convert.add_argument("--nfs", action="store_true",
+                          help="treat input as being on NFS: read it from there but write output to local disk "
+                               f"instead of alongside the source (default local dir: {NFS_LOCAL_DIR}; override with "
+                               "-o), checking free space on the destination first")
 
     compare = subparsers.add_parser("compare", help="score an already-converted file's VMAF against its original")
     compare.add_argument("original", type=Path, help="the original, unconverted source file")
@@ -654,9 +687,13 @@ def main(argv=None):
             print(f"no video files found in {args.input}")
             return 0
 
-        output_dir = args.output or args.input
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = args.output or (NFS_LOCAL_DIR if args.nfs else args.input)
         report_path = args.report or (args.input / "conversion-report.json")
+
+        if args.nfs:
+            print(f"--nfs: reading from {args.input}, writing converted files locally to {output_dir}")
+        if not args.dry_run:
+            output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"converting {len(files)} file(s) from {args.input} with {args.jobs} concurrent job(s)")
         results = run_batch(files, args, output_dir)
@@ -677,7 +714,9 @@ def main(argv=None):
 
         return 1 if errors else 0
 
-    output_path = args.output or default_output_path(args.input)
+    output_path = args.output or default_output_path(args.input, NFS_LOCAL_DIR if args.nfs else None)
+    if args.nfs:
+        print(f"--nfs: reading {args.input}, writing converted output locally to {output_path}")
     board = ProgressBoard()
     key = str(args.input)
     entry = process_one(args.input, output_path, args, report=lambda text: board.update(key, text))
