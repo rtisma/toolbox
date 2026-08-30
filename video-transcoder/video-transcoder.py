@@ -33,7 +33,7 @@ isn't "convert", "compare", or "check-libvmaf"), "compare", "check-libvmaf".
     python3 video-transcoder.py input.mov --no-compare
     python3 video-transcoder.py ./videos/ --jobs 3
     python3 video-transcoder.py ./videos/ --jobs 3 --report ./videos/report.json
-    python3 video-transcoder.py ./videos/ --retries 2 --slack-webhook https://hooks.slack.com/services/...
+    python3 video-transcoder.py ./videos/ --retries 2 --slack-bot-token xoxb-... --slack-channel my-channel
     python3 video-transcoder.py compare input.mov input.converted.mp4
     python3 video-transcoder.py check-libvmaf
     python3 video-transcoder.py /mnt/nfs/videos/clip.mov --nfs
@@ -564,12 +564,19 @@ def build_single_slack_message(input_path, entry, args):
     return "\n".join(lines)
 
 
-def notify_slack(webhook_url, message):
-    payload = json.dumps({"text": message}).encode("utf-8")
-    req = urllib.request.Request(webhook_url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+def notify_slack(bot_token, channel, message):
+    payload = json.dumps({"channel": channel, "text": message}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://slack.com/api/chat.postMessage",
+        data=payload,
+        headers={"Content-Type": "application/json; charset=utf-8", "Authorization": f"Bearer {bot_token}"},
+        method="POST",
+    )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
+            body = json.loads(resp.read())
+        if not body.get("ok"):
+            print(f"warning: slack notification failed: {body.get('error', 'unknown error')}", file=sys.stderr)
     except urllib.error.URLError as err:
         print(f"warning: slack notification failed: {err}", file=sys.stderr)
 
@@ -618,8 +625,12 @@ def build_parser():
     convert.add_argument("-j", "--jobs", type=int, default=4, help="number of files to convert concurrently in directory mode (default: 4)")
     convert.add_argument("-r", "--report", type=Path, help="path for the JSON report in directory mode (default: <directory>/conversion-report.json)")
     convert.add_argument("--retries", type=int, default=0, help="retry a failed conversion this many times (default: 0)")
-    convert.add_argument("--slack-webhook", default=os.environ.get("SLACK_WEBHOOK_URL"),
-                          help="Slack incoming webhook URL for a completion notification (default: $SLACK_WEBHOOK_URL)")
+    convert.add_argument("--slack-bot-token", default=os.environ.get("SLACK_BOT_TOKEN"),
+                          help="Slack bot token for a completion notification (default: $SLACK_BOT_TOKEN); "
+                               "notification is disabled unless both this and --slack-channel are set")
+    convert.add_argument("--slack-channel", default=os.environ.get("SLACK_CHANNEL"),
+                          help="Slack channel name or ID to notify on completion (default: $SLACK_CHANNEL); "
+                               "notification is disabled unless both this and --slack-bot-token are set")
     convert.add_argument("--nfs", action="store_true",
                           help="treat input as being on NFS: read it from there but write output to local disk "
                                f"instead of alongside the source (default local dir: {NFS_LOCAL_DIR}; override with "
@@ -717,6 +728,10 @@ def main(argv=None):
     if args.compare:
         require_libvmaf_or_exit()
 
+    if bool(args.slack_bot_token) != bool(args.slack_channel):
+        missing = "--slack-channel" if args.slack_bot_token else "--slack-bot-token"
+        print(f"warning: Slack notification disabled -- {missing} not set", file=sys.stderr)
+
     if args.input.is_dir():
         files = discover_videos(args.input)
         if not files:
@@ -745,8 +760,9 @@ def main(argv=None):
             print(f"done: {len(ok)} converted, {len(errors)} failed, {human_size(total_saved)} saved total")
         print(f"report written to {report_path}")
 
-        if args.slack_webhook:
-            notify_slack(args.slack_webhook, build_batch_slack_message(args, args.input, results, report_path))
+        if args.slack_bot_token and args.slack_channel:
+            notify_slack(args.slack_bot_token, args.slack_channel,
+                         build_batch_slack_message(args, args.input, results, report_path))
 
         return 1 if errors else 0
 
@@ -762,8 +778,8 @@ def main(argv=None):
         args.report.write_text(json.dumps([entry], indent=2))
         print(f"report written to {args.report}")
 
-    if args.slack_webhook:
-        notify_slack(args.slack_webhook, build_single_slack_message(args.input, entry, args))
+    if args.slack_bot_token and args.slack_channel:
+        notify_slack(args.slack_bot_token, args.slack_channel, build_single_slack_message(args.input, entry, args))
 
     return 0 if entry["status"] in ("ok", "dry-run") else 1
 

@@ -26,7 +26,7 @@ python3 video-transcoder.py ./videos/ --jobs 3
 python3 video-transcoder.py ./videos/ --jobs 3 --report ./videos/report.json
 
 # retry failures up to twice, and post a summary to Slack when done
-python3 video-transcoder.py ./videos/ --retries 2 --slack-webhook https://hooks.slack.com/services/...
+python3 video-transcoder.py ./videos/ --retries 2 --slack-bot-token xoxb-... --slack-channel my-channel
 
 # score a file you already converted, without converting anything
 python3 video-transcoder.py compare input.mov input.converted.mp4
@@ -61,7 +61,8 @@ given — `myfile.mov` becomes `myfile.converted.mp4`.
 | `-j/--jobs` | `4` | directory mode: how many files to convert concurrently |
 | `-r/--report` | `<directory>/conversion-report.json` | directory mode: where to write the JSON report |
 | `--retries` | `0` | retry a failed conversion this many times before giving up |
-| `--slack-webhook` | `$SLACK_WEBHOOK_URL` | if set, post a completion summary to this Slack incoming webhook |
+| `--slack-bot-token` | `$SLACK_BOT_TOKEN` | Slack bot token; notification is disabled unless this and `--slack-channel` are both set |
+| `--slack-channel` | `$SLACK_CHANNEL` | Slack channel name or ID; notification is disabled unless this and `--slack-bot-token` are both set |
 | `--nfs` | off | read from the source but write output to local disk instead (see "Reading from NFS" below) |
 
 By default, after encoding the script runs a VMAF (Netflix's perceptual
@@ -101,17 +102,21 @@ to retry a failing file up to `N` additional times (each retry deletes the
 partial output first) before it's marked as failed; successful entries that
 needed a retry get an `"attempts"` field.
 
-If `--slack-webhook` (or `$SLACK_WEBHOOK_URL`) is set, a formatted summary is
-posted there when the run finishes — status emoji, converted/failed counts,
-total space saved, average VMAF, a bullet per failed file with its root-cause
-error line, and the codec/CRF/jobs/retries settings used. Single-file runs
-post a one-line result (or the error, in a code block, on failure) instead.
-A failed Slack POST only prints a warning; it never fails the conversion.
+If `--slack-bot-token` and `--slack-channel` (or `$SLACK_BOT_TOKEN`/`$SLACK_CHANNEL`)
+are both set, a formatted summary is posted there when the run finishes —
+status emoji, converted/failed counts, total space saved, average VMAF, a
+bullet per failed file with its root-cause error line, and the
+codec/CRF/jobs/retries settings used. Single-file runs post a one-line
+result (or the error, in a code block, on failure) instead. A failed
+Slack post only prints a warning; it never fails the conversion. If only
+one of the two is set, notification is disabled with a one-line warning
+explaining which one is missing — the bot token needs `chat:write` scope
+and must be invited to the target channel.
 
-`--dry-run` combines with both `--retries` and `--slack-webhook` so you can
-test the retry policy and Slack formatting/connectivity without doing any
-real encoding — the message is clearly marked `:test_tube: DRY RUN` and
-lists what *would* be converted instead of real results:
+`--dry-run` combines with both `--retries` and `--slack-bot-token`/`--slack-channel`
+so you can test the retry policy and Slack formatting/connectivity without
+doing any real encoding — the message is clearly marked `:test_tube: DRY RUN`
+and lists what *would* be converted instead of real results:
 
 ```
 :test_tube: *video-transcoder* — DRY RUN — `./videos`
