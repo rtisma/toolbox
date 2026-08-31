@@ -114,34 +114,20 @@ class DiskSpaceError(RuntimeError):
 NFS_LOCAL_DIR = Path(tempfile.gettempdir()) / "video-transcoder"
 
 
-class SpaceLedger:
-    """Tracks bytes claimed by conversions currently writing to disk, so a disk-space
-    check for file B accounts for file A's conversion that's in flight (and hasn't
-    necessarily finished writing, so the OS free-space figure alone would overcount
-    what's actually available) rather than just reading a point-in-time OS snapshot
-    that a concurrent file could equally have already "passed" a moment earlier."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.reserved_bytes = 0
-
-    def reserve(self, output_dir, required_bytes):
-        existing = next((p for p in (output_dir, *output_dir.parents) if p.exists()), Path(output_dir.anchor or "/"))
-        with self.lock:
-            free = shutil.disk_usage(existing).free
-            available = free - self.reserved_bytes
-            if available < required_bytes:
-                raise DiskSpaceError(
-                    f"not enough free space for {output_dir}: {human_size(free)} free"
-                    + (f" ({human_size(self.reserved_bytes)} already claimed by other in-flight conversions)"
-                       if self.reserved_bytes else "")
-                    + f", need at least {human_size(required_bytes)} (source file size)"
-                )
-            self.reserved_bytes += required_bytes
-
-    def release(self, required_bytes):
-        with self.lock:
-            self.reserved_bytes = max(0, self.reserved_bytes - required_bytes)
+def check_disk_space(output_dir, required_bytes):
+    """One-shot check: does output_dir's filesystem have at least required_bytes free
+    right now? Call this once up front with the combined size of everything about to
+    be written, before starting any conversion -- not per file mid-run, since by the
+    time a later file starts, earlier ones may already be consuming the space this
+    check accounted for."""
+    existing = next((p for p in (output_dir, *output_dir.parents) if p.exists()), Path(output_dir.anchor or "/"))
+    free = shutil.disk_usage(existing).free
+    if free < required_bytes:
+        raise DiskSpaceError(
+            f"not enough free space for {output_dir}: {human_size(free)} free, "
+            f"need at least {human_size(required_bytes)} (combined size of the source file(s) -- "
+            "a worst-case estimate, since converted output is almost always smaller)"
+        )
 
 
 def probe_video(path):
@@ -533,7 +519,7 @@ def build_command(input_path, output_path, args, target_height, fps):
     return cmd, cap_kbps
 
 
-def process_one(input_path, output_path, args, report=None, space_ledger=None):
+def process_one(input_path, output_path, args, report=None):
     """Transcode input_path -> output_path and return a result dict describing the outcome.
     If given, report(text) is called with a live-updating status line for this file."""
     entry = {"file": str(input_path), "output": str(output_path), "codec": args.codec, "crf": args.crf, "preset": args.preset}
@@ -557,64 +543,53 @@ def process_one(input_path, output_path, args, report=None, space_ledger=None):
             dry_entry["nfs_note"] = f"would read from NFS, write locally to {output_path.parent}"
         return dry_entry
 
-    required_bytes = input_path.stat().st_size
-    if args.nfs:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    max_attempts = args.retries + 1
+    log_text = ""
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1 and report:
+            report(f"{input_path.name:<24.24} retrying (attempt {attempt}/{max_attempts})...")
+
+        def on_tick(pct, elapsed, speed, _attempt=attempt):
+            if report:
+                line = format_progress_line(input_path.name, pct, elapsed, duration, speed)
+                if max_attempts > 1:
+                    line += f"  [attempt {_attempt}/{max_attempts}]"
+                report(line)
+
+        returncode, log_text = run_ffmpeg_with_progress(cmd, duration, on_tick if report else None)
+        if returncode == 0:
+            break
+        output_path.unlink(missing_ok=True)  # drop any partial output so a re-run retries this file
+        if attempt == max_attempts:
+            return {**entry, "status": "error", "error": log_text.strip()[-2000:], "attempts": attempt}
+    entry["attempts"] = attempt
+
+    original_bytes = input_path.stat().st_size
+    converted_bytes = output_path.stat().st_size
+    entry.update({
+        "status": "ok",
+        "original_bytes": original_bytes,
+        "converted_bytes": converted_bytes,
+        "savings_bytes": original_bytes - converted_bytes,
+        "savings_percent": round((1 - converted_bytes / original_bytes) * 100, 2) if original_bytes else 0.0,
+    })
+
+    if args.compare:
+        def on_vmaf_tick(pct, elapsed, speed):
+            if report:
+                report(format_progress_line(input_path.name, pct, elapsed, duration, speed) + "  [vmaf]")
+
         try:
-            space_ledger.reserve(output_path.parent, required_bytes)
-        except DiskSpaceError as err:
-            return {**entry, "status": "error", "error": str(err)}
+            score = run_vmaf(reference=input_path, distorted=output_path, duration=duration,
+                              on_tick=on_vmaf_tick if report else None)
+            entry["vmaf"] = round(score, 2)
+            entry["vmaf_rating"] = rate_vmaf(score)
+        except ProbeError as err:
+            entry["vmaf_error"] = str(err)
 
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        max_attempts = args.retries + 1
-        log_text = ""
-        for attempt in range(1, max_attempts + 1):
-            if attempt > 1 and report:
-                report(f"{input_path.name:<24.24} retrying (attempt {attempt}/{max_attempts})...")
-
-            def on_tick(pct, elapsed, speed, _attempt=attempt):
-                if report:
-                    line = format_progress_line(input_path.name, pct, elapsed, duration, speed)
-                    if max_attempts > 1:
-                        line += f"  [attempt {_attempt}/{max_attempts}]"
-                    report(line)
-
-            returncode, log_text = run_ffmpeg_with_progress(cmd, duration, on_tick if report else None)
-            if returncode == 0:
-                break
-            output_path.unlink(missing_ok=True)  # drop any partial output so a re-run retries this file
-            if attempt == max_attempts:
-                return {**entry, "status": "error", "error": log_text.strip()[-2000:], "attempts": attempt}
-        entry["attempts"] = attempt
-
-        original_bytes = input_path.stat().st_size
-        converted_bytes = output_path.stat().st_size
-        entry.update({
-            "status": "ok",
-            "original_bytes": original_bytes,
-            "converted_bytes": converted_bytes,
-            "savings_bytes": original_bytes - converted_bytes,
-            "savings_percent": round((1 - converted_bytes / original_bytes) * 100, 2) if original_bytes else 0.0,
-        })
-
-        if args.compare:
-            def on_vmaf_tick(pct, elapsed, speed):
-                if report:
-                    report(format_progress_line(input_path.name, pct, elapsed, duration, speed) + "  [vmaf]")
-
-            try:
-                score = run_vmaf(reference=input_path, distorted=output_path, duration=duration,
-                                  on_tick=on_vmaf_tick if report else None)
-                entry["vmaf"] = round(score, 2)
-                entry["vmaf_rating"] = rate_vmaf(score)
-            except ProbeError as err:
-                entry["vmaf_error"] = str(err)
-
-        return entry
-    finally:
-        if args.nfs:
-            space_ledger.release(required_bytes)
+    return entry
 
 
 def summarize_entry(entry):
@@ -738,12 +713,10 @@ def notify_slack(bot_token, channel, message):
 
 def run_batch(files, args, output_dir):
     board = ProgressBoard()
-    space_ledger = SpaceLedger()
 
     def task(f):
         key = str(f)
-        entry = process_one(f, default_output_path(f, output_dir), args,
-                             report=lambda text: board.update(key, text), space_ledger=space_ledger)
+        entry = process_one(f, default_output_path(f, output_dir), args, report=lambda text: board.update(key, text))
         board.finish(key, summarize_entry(entry))
         return entry
 
@@ -954,6 +927,13 @@ def main(argv=None):
 
         if args.nfs:
             print(f"--nfs: reading from {args.input}, writing converted files locally to {output_dir}")
+            if not args.dry_run:
+                total_bytes = sum(f.stat().st_size for f in files)
+                try:
+                    check_disk_space(output_dir, total_bytes)
+                except DiskSpaceError as err:
+                    print(f"error: {err}", file=sys.stderr)
+                    return 1
         if not args.dry_run:
             output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -980,10 +960,15 @@ def main(argv=None):
     output_path = args.output or default_output_path(args.input, NFS_LOCAL_DIR if args.nfs else None)
     if args.nfs:
         print(f"--nfs: reading {args.input}, writing converted output locally to {output_path}")
+        if not args.dry_run:
+            try:
+                check_disk_space(output_path.parent, args.input.stat().st_size)
+            except DiskSpaceError as err:
+                print(f"error: {err}", file=sys.stderr)
+                return 1
     board = ProgressBoard()
     key = str(args.input)
-    entry = process_one(args.input, output_path, args, report=lambda text: board.update(key, text),
-                         space_ledger=SpaceLedger())
+    entry = process_one(args.input, output_path, args, report=lambda text: board.update(key, text))
     board.finish(key, summarize_entry(entry))
     if args.report:
         args.report.write_text(json.dumps([entry], indent=2))

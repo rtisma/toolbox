@@ -186,23 +186,16 @@ disk. Without `-o`, output goes to a shared local temp directory
 this the same way it does normally (output file for a single input, output
 directory for a directory input).
 
-Before writing, it checks free space on the destination filesystem against
-the source file's size (a safe upper bound, since converted output is
-almost always smaller) and fails that file with a clear error — no ffmpeg
-run, no partial file — if there isn't enough room, rather than running out
-of disk mid-encode.
-
-In directory mode with `--jobs > 1`, several files reserve space at once.
-A per-file check against a fresh OS free-space reading each time isn't
-enough on its own — two files could each see the same free space a moment
-apart and both pass, even though combined they don't fit. A shared,
-lock-protected ledger tracks bytes already claimed by conversions that are
-still in flight (i.e. haven't necessarily finished writing yet) and
-subtracts that from the OS-reported free space before approving the next
-file, releasing the claim once that file's conversion finishes (success or
-failure). It's still a snapshot-based check, not a filesystem-level
-reservation — actual usage can differ slightly from a file's declared size
-— but it prevents the concurrent-approval race, not just a single-file one.
+Before writing, it checks free space on the destination filesystem once,
+up front, against the **combined** size of everything about to be
+converted — the single source file for a single input, or the sum of
+every file in the directory for a directory input — and fails the whole
+run with a clear error, before starting any conversion, if there isn't
+enough room. A file's own size is a safe worst-case stand-in for its
+converted output size (output is almost always smaller), so summing
+source sizes gives a conservative estimate of total space needed even
+under `--jobs > 1` concurrency, without having to track how much of that
+estimate each in-flight file has actually consumed.
 
 ## Auto-tuning quality
 
