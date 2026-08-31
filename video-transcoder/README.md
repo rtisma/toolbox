@@ -39,6 +39,9 @@ python3 video-transcoder.py /mnt/nfs/videos/clip.mov --nfs
 
 # don't know the right CRF for this content? auto-discover it (see "Auto-tuning quality" below)
 python3 video-transcoder.py ./videos/ --target-vmaf 93
+
+# multiple inputs: any mix of files and directories in one run
+python3 video-transcoder.py clip1.mov clip2.mov ./more-videos/ ./even-more-videos/
 ```
 
 Three subcommands: `convert` (conversion — the default, so `video-transcoder.py input.mov` is short for
@@ -54,7 +57,7 @@ given — `myfile.mov` becomes `myfile.converted.mp4`.
 
 | Flag | Default | Notes |
 |------|---------|-------|
-| `-o/--output` | alongside source, `<basename>.converted.mp4` | single input: output file path; directory input: output directory |
+| `-o/--output` | alongside source, `<basename>.converted.mp4` | a single file as the only input: output file path; otherwise (multiple inputs, or any directory input): output directory |
 | `-c/--codec` | `h265` | `h265` or `h264` |
 | `--height` | source height | downscale (e.g. `720`, `480`, `360`) |
 | `--crf` | `23` (h264) / `20` (h265) | lower = higher quality/bigger file |
@@ -64,8 +67,8 @@ given — `myfile.mov` becomes `myfile.converted.mp4`.
 | `--target-vmaf` | off (bare flag: `93.0`) | auto-discover `--crf`/`--maxrate` for this VMAF target (see "Auto-tuning quality" below) |
 | `--dry-run` | off | print the planned ffmpeg command(s) without running them |
 | `--compare`/`--no-compare` | on | after encoding, score the output against the source with VMAF |
-| `-j/--jobs` | `4` | directory mode: how many files to convert concurrently; also caps how many `--target-vmaf` sample clips are encoded/scored concurrently per generation |
-| `-r/--report` | `<directory>/conversion-report.json` | directory mode: where to write the JSON report |
+| `-j/--jobs` | `4` | when converting more than one file: how many run concurrently; also caps how many `--target-vmaf` sample clips are encoded/scored concurrently per generation |
+| `-r/--report` | `conversion-report.json` next to the first input | when converting more than one file: where to write the JSON report |
 | `--retries` | `0` | retry a failed conversion this many times before giving up |
 | `--slack-bot-token` | `$SLACK_BOT_TOKEN` | Slack bot token; notification is disabled unless this and `--slack-channel` are both set |
 | `--slack-channel` | `$SLACK_CHANNEL` | Slack channel name or ID; notification is disabled unless this and `--slack-bot-token` are both set |
@@ -82,9 +85,14 @@ noticeable degradation, below that poor.
 
 Pass a directory instead of a file and every video in it (matched by
 extension, non-recursive; files already named `*.converted.mp4` are skipped
-so re-running is safe) is converted, up to `--jobs` at a time. A JSON report
-is written with one entry per file — status, original/converted size,
-space savings, and VMAF score:
+so re-running is safe) is converted, up to `--jobs` at a time. You can also
+pass multiple inputs — any mix of files and directories — in one run;
+duplicates (e.g. the same file reachable both directly and via a directory
+argument) are converted once. Whenever more than one file results from
+this — a directory, or more than one input of any kind — it's treated as a
+batch: `-o` (if given) is a shared output directory rather than an exact
+output filename, and a JSON report is written with one entry per file —
+status, original/converted size, space savings, and VMAF score:
 
 ```json
 [
@@ -177,21 +185,21 @@ python3 video-transcoder.py /mnt/nfs/videos/ --nfs --jobs 4
 python3 video-transcoder.py /mnt/nfs/videos/clip.mov --nfs -o /scratch/clip.converted.mp4
 ```
 
-`--nfs` reads the source from wherever it is (NFS or otherwise) but writes
-the converted output to local disk instead of alongside the source —
+`--nfs` reads the source(s) from wherever they are (NFS or otherwise) but
+writes the converted output to local disk instead of alongside the source —
 useful because writing (especially the `-movflags +faststart` rewrite at
 the end of encoding) is much slower and less reliable over NFS than local
 disk. Without `-o`, output goes to a shared local temp directory
 (`$TMPDIR/video-transcoder`, e.g. `/tmp/video-transcoder`); `-o` overrides
-this the same way it does normally (output file for a single input, output
-directory for a directory input).
+this the same way it does normally (output file when a single file is the
+only input, output directory otherwise).
 
 Before writing, it checks free space on the destination filesystem once,
 up front, against the **combined** size of everything about to be
-converted — the single source file for a single input, or the sum of
-every file in the directory for a directory input — and fails the whole
-run with a clear error, before starting any conversion, if there isn't
-enough room. A file's own size is a safe worst-case stand-in for its
+converted — the one source file when that's the only input, or the sum of
+every file across all inputs otherwise — and fails the whole run with a
+clear error, before starting any conversion, if there isn't enough room.
+A file's own size is a safe worst-case stand-in for its
 converted output size (output is almost always smaller), so summing
 source sizes gives a conservative estimate of total space needed even
 under `--jobs > 1` concurrency, without having to track how much of that
@@ -231,8 +239,8 @@ those flags for that reason. Requires `libvmaf` (checked up front, like
 `--compare`) regardless of whether `--no-compare` is also set, since the
 search itself depends on VMAF even if you don't want a final check.
 
-**In directory mode, tuning runs once, against the first file** — not
-per file. This is deliberate: comprehensively tuning every file in a
+**When converting more than one file, tuning runs once, against the
+first one** — not per file. This is deliberate: comprehensively tuning every file in a
 100-file batch would mean 100x the sampling/search cost. If the files come
 from the same recording session or device (the common case for a batch),
 one file's tuned settings are a reasonable estimate for the rest. If your

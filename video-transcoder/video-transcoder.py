@@ -11,11 +11,12 @@ is set generously (~3.5x H.264/2) so it only binds on genuinely pathological
 content, since CRF -- not the cap -- should be doing the quality work.
 
 Output files are named <basename>.converted.mp4 (myfile.mov -> myfile.converted.mp4).
-When given a directory, every video file in it is converted — set --jobs to
-control how many run at once — and a JSON report with per-file space savings
-and VMAF scores is written. Each in-flight file gets a live progress bar
-(percent/time/speed) in the terminal; concurrent conversions each get their
-own line, stacked.
+Accepts one or more inputs, each a video file or a directory of them, in any
+mix -- e.g. "clip1.mov clip2.mov ./videos/". Whenever that resolves to more
+than one file, --jobs controls how many run at once, and a JSON report with
+per-file space savings and VMAF scores is written. Each in-flight file gets
+a live progress bar (percent/time/speed) in the terminal; concurrent
+conversions each get their own line, stacked.
 
 VMAF scoring (on by default) requires ffmpeg to be built with libvmaf; this
 is checked up front, before any conversion starts, and the script exits
@@ -26,11 +27,11 @@ re-running any conversion.
 
 --target-vmaf auto-discovers --crf (and a derived --maxrate) instead of
 using the fixed defaults: it extracts a few short sample clips from across
-the input, binary-searches CRF against them for the highest value (smallest
+one input, binary-searches CRF against them for the highest value (smallest
 file) that still meets the target VMAF, then measures the tuned CRF's
-actual bitrate to derive a sane --maxrate. In directory mode this runs
-once, against the first file, and the result is applied to the whole
-batch — not re-tuned per file — since files from the same recording
+actual bitrate to derive a sane --maxrate. When converting more than one
+file, this runs once, against the first one, and the result is applied to
+the rest — not re-tuned per file — since files from the same recording
 session/device are usually similar enough that one file's tuned settings
 are a good estimate for the rest.
 
@@ -43,6 +44,7 @@ isn't "convert", "compare", or "check-libvmaf"), "compare", "check-libvmaf".
     python3 video-transcoder.py input.mov --no-compare
     python3 video-transcoder.py ./videos/ --jobs 3
     python3 video-transcoder.py ./videos/ --jobs 3 --report ./videos/report.json
+    python3 video-transcoder.py clip1.mov clip2.mov ./more-videos/ ./even-more-videos/
     python3 video-transcoder.py ./videos/ --retries 2 --slack-bot-token xoxb-... --slack-channel my-channel
     python3 video-transcoder.py compare input.mov input.converted.mp4
     python3 video-transcoder.py check-libvmaf
@@ -357,6 +359,25 @@ def discover_videos(directory):
     )
 
 
+def gather_files(inputs):
+    """Expand a mix of file and directory inputs into a flat, deduplicated file list,
+    in the order given (directories contribute their sorted contents in place)."""
+    files, seen = [], set()
+    for p in inputs:
+        for f in (discover_videos(p) if p.is_dir() else [p]):
+            if f not in seen:
+                seen.add(f)
+                files.append(f)
+    return files
+
+
+def describe_inputs(inputs, limit=3):
+    names = [str(p) for p in inputs]
+    if len(names) <= limit:
+        return ", ".join(names)
+    return ", ".join(names[:limit]) + f", and {len(names) - limit} more"
+
+
 def pick_sample_starts(duration, count):
     """Evenly space `count` sample start times across the middle 80% of `duration`,
     avoiding likely intro/outro (black frames, fades, credits) at either end."""
@@ -628,14 +649,14 @@ def _error_tail(error_text, limit=200):
     return lines[-1][:limit]
 
 
-def build_batch_slack_message(args, input_dir, results, report_path):
+def build_batch_slack_message(args, label, results, report_path):
     dry = [r for r in results if r["status"] == "dry-run"]
     if dry:
         settings = f"codec `{args.codec}` · CRF `{args.crf}` · jobs `{args.jobs}`"
         if args.retries:
             settings += f" · retries `{args.retries}`"
         lines = [
-            f":test_tube: *video-transcoder* — DRY RUN — `{input_dir}`",
+            f":test_tube: *video-transcoder* — DRY RUN — `{label}`",
             f"*{len(dry)} file(s)* would be converted ({settings})",
             "",
         ]
@@ -653,7 +674,7 @@ def build_batch_slack_message(args, input_dir, results, report_path):
     headline = f"*{len(ok)} converted* · *{len(errors)} failed* · *{human_size(total_saved)} saved* ({savings_pct:.1f}%)"
     if vmaf_scores:
         headline += f" · avg VMAF *{sum(vmaf_scores) / len(vmaf_scores):.2f}*"
-    lines = [f"{icon} *video-transcoder* — `{input_dir}`", headline]
+    lines = [f"{icon} *video-transcoder* — `{label}`", headline]
 
     if errors:
         lines.append("")
@@ -739,10 +760,12 @@ def build_parser():
     convert = subparsers.add_parser(
         "convert", help="convert a video file or a directory of them (default when no subcommand is given)"
     )
-    convert.add_argument("input", type=Path, help="source video file, or a directory of video files")
+    convert.add_argument("inputs", type=Path, nargs="+",
+                          help="one or more source video files and/or directories of video files")
     convert.add_argument("-o", "--output", type=Path,
-                          help="output file for a single input, or output directory for a directory input "
-                               "(default: alongside each source, named <basename>.converted.mp4)")
+                          help="output file when a single file is the only input, or output directory otherwise "
+                               "(multiple inputs, or any directory input) (default: alongside each source, "
+                               "named <basename>.converted.mp4)")
     convert.add_argument("-c", "--codec", choices=["h265", "h264"], default="h265")
     convert.add_argument("--height", type=int, help="downscale to this height (e.g. 480, 720); default: keep source resolution")
     convert.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 20); lower = higher quality")
@@ -757,10 +780,10 @@ def build_parser():
                                "content. Mutually exclusive with --maxrate")
     convert.add_argument("--target-vmaf", type=float, nargs="?", const=93.0, default=None,
                           help="auto-discover --crf (and a derived --maxrate) by sampling short clips from across "
-                               "the input and binary-searching for the CRF that hits this VMAF (bare flag defaults "
-                               "to 93.0). In directory mode, tuning runs once against the first file and the "
-                               "result is reused for the whole batch -- not re-tuned per file. Requires libvmaf. "
-                               "Mutually exclusive with --crf/--maxrate/--uncapped")
+                               "one input and binary-searching for the CRF that hits this VMAF (bare flag defaults "
+                               "to 93.0). When converting more than one file, tuning runs once against the first "
+                               "one and the result is reused for the rest -- not re-tuned per file. Requires "
+                               "libvmaf. Mutually exclusive with --crf/--maxrate/--uncapped")
     convert.add_argument("--tune-generations", type=int, default=6,
                           help="max binary-search iterations for --target-vmaf (default: 6)")
     convert.add_argument("--tune-samples", type=int, default=3,
@@ -772,8 +795,11 @@ def build_parser():
     convert.add_argument("--dry-run", action="store_true", help="print the planned ffmpeg command(s) without running them")
     convert.add_argument("--compare", action=argparse.BooleanOptionalAction, default=True,
                           help="after encoding, compute the VMAF score against the source (default: on; use --no-compare to skip)")
-    convert.add_argument("-j", "--jobs", type=int, default=4, help="number of files to convert concurrently in directory mode (default: 4)")
-    convert.add_argument("-r", "--report", type=Path, help="path for the JSON report in directory mode (default: <directory>/conversion-report.json)")
+    convert.add_argument("-j", "--jobs", type=int, default=4,
+                          help="number of files to convert concurrently when converting more than one (default: 4)")
+    convert.add_argument("-r", "--report", type=Path,
+                          help="path for the JSON report when converting more than one file "
+                               "(default: conversion-report.json in the current directory)")
     convert.add_argument("--retries", type=int, default=0, help="retry a failed conversion this many times (default: 0)")
     convert.add_argument("--slack-bot-token", default=os.environ.get("SLACK_BOT_TOKEN"),
                           help="Slack bot token for a completion notification (default: $SLACK_BOT_TOKEN); "
@@ -804,8 +830,9 @@ def parse_args(argv):
     args = parser.parse_args(argv)
 
     if args.subcommand == "convert":
-        if not args.input.exists():
-            convert.error(f"input path not found: {args.input}")
+        for p in args.inputs:
+            if not p.exists():
+                convert.error(f"input path not found: {p}")
         if args.jobs < 1:
             convert.error("--jobs must be >= 1")
         if args.retries < 0:
@@ -896,17 +923,22 @@ def main(argv=None):
         missing = "--slack-channel" if args.slack_bot_token else "--slack-bot-token"
         print(f"warning: Slack notification disabled -- {missing} not set", file=sys.stderr)
 
-    files = discover_videos(args.input) if args.input.is_dir() else None
-    if files is not None and not files:
-        print(f"no video files found in {args.input}")
-        return 0
+    is_single_file = len(args.inputs) == 1 and args.inputs[0].is_file()
+
+    if is_single_file:
+        files, tune_target = None, args.inputs[0]
+    else:
+        files = gather_files(args.inputs)
+        if not files:
+            print(f"no video files found in {describe_inputs(args.inputs)}")
+            return 0
+        tune_target = files[0]
 
     if args.target_vmaf is not None:
-        tune_target = files[0] if files else args.input
         if args.dry_run:
             print(f"--target-vmaf {args.target_vmaf}: would tune CRF/maxrate using {tune_target} "
                   f"({args.tune_samples} sample(s), up to {args.tune_generations} generation(s)) and apply "
-                  "the result to " + ("the whole batch" if files else "this file"))
+                  "the result to " + ("this file" if is_single_file else "the rest"))
         else:
             print(f"tuning quality using {tune_target} (target VMAF {args.target_vmaf}, up to "
                   f"{args.tune_generations} generation(s), {args.tune_samples} sample(s))...")
@@ -921,12 +953,15 @@ def main(argv=None):
             args.crf, args.maxrate, args.uncapped = crf, maxrate_kbps, False
         args.target_vmaf = None  # resolved -- downstream treats crf/maxrate as if passed explicitly
 
-    if files is not None:
-        output_dir = args.output or (NFS_LOCAL_DIR if args.nfs else args.input)
-        report_path = args.report or (args.input / "conversion-report.json")
+    if not is_single_file:
+        label = describe_inputs(args.inputs)
+        output_dir = args.output or (NFS_LOCAL_DIR if args.nfs else None)
+        first = args.inputs[0]
+        default_report_dir = first if first.is_dir() else first.parent
+        report_path = args.report or (default_report_dir / "conversion-report.json")
 
         if args.nfs:
-            print(f"--nfs: reading from {args.input}, writing converted files locally to {output_dir}")
+            print(f"--nfs: reading from {label}, writing converted files locally to {output_dir}")
             if not args.dry_run:
                 total_bytes = sum(f.stat().st_size for f in files)
                 try:
@@ -934,10 +969,10 @@ def main(argv=None):
                 except DiskSpaceError as err:
                     print(f"error: {err}", file=sys.stderr)
                     return 1
-        if not args.dry_run:
+        if not args.dry_run and output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"converting {len(files)} file(s) from {args.input} with {args.jobs} concurrent job(s)")
+        print(f"converting {len(files)} file(s) from {label} with {args.jobs} concurrent job(s)")
         results = run_batch(files, args, output_dir)
         report_path.write_text(json.dumps(results, indent=2))
 
@@ -953,29 +988,30 @@ def main(argv=None):
 
         if args.slack_bot_token and args.slack_channel:
             notify_slack(args.slack_bot_token, args.slack_channel,
-                         build_batch_slack_message(args, args.input, results, report_path))
+                         build_batch_slack_message(args, label, results, report_path))
 
         return 1 if errors else 0
 
-    output_path = args.output or default_output_path(args.input, NFS_LOCAL_DIR if args.nfs else None)
+    input_path = args.inputs[0]
+    output_path = args.output or default_output_path(input_path, NFS_LOCAL_DIR if args.nfs else None)
     if args.nfs:
-        print(f"--nfs: reading {args.input}, writing converted output locally to {output_path}")
+        print(f"--nfs: reading {input_path}, writing converted output locally to {output_path}")
         if not args.dry_run:
             try:
-                check_disk_space(output_path.parent, args.input.stat().st_size)
+                check_disk_space(output_path.parent, input_path.stat().st_size)
             except DiskSpaceError as err:
                 print(f"error: {err}", file=sys.stderr)
                 return 1
     board = ProgressBoard()
-    key = str(args.input)
-    entry = process_one(args.input, output_path, args, report=lambda text: board.update(key, text))
+    key = str(input_path)
+    entry = process_one(input_path, output_path, args, report=lambda text: board.update(key, text))
     board.finish(key, summarize_entry(entry))
     if args.report:
         args.report.write_text(json.dumps([entry], indent=2))
         print(f"report written to {args.report}")
 
     if args.slack_bot_token and args.slack_channel:
-        notify_slack(args.slack_bot_token, args.slack_channel, build_single_slack_message(args.input, entry, args))
+        notify_slack(args.slack_bot_token, args.slack_channel, build_single_slack_message(input_path, entry, args))
 
     return 0 if entry["status"] in ("ok", "dry-run") else 1
 
