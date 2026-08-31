@@ -436,49 +436,63 @@ def auto_tune_quality(input_path, args, duration, log=print):
             return DEFAULT_CRF[args.codec], None, {"tuned": False, "reason": "no samples extracted"}
         log(f"  extracted {len(sample_paths)} sample clip(s) (~{args.tune_sample_duration:.0f}s each)")
 
-        trials, best = [], None
-        for generation in range(1, args.tune_generations + 1):
-            crf = (lo + hi) // 2
-            scores = []
-            for sample_path in sample_paths:
-                candidate = tmp_dir / f"g{generation}_{sample_path.stem}.mkv"
-                if encode_sample(sample_path, candidate, args.codec, crf, args.preset):
-                    try:
-                        scores.append(run_vmaf(reference=sample_path, distorted=candidate))
-                    except ProbeError:
-                        pass
+        def score_sample(sample_path, tag, crf):
+            """Encode one sample at `crf` and VMAF-score it against itself; runs in a worker thread."""
+            candidate = tmp_dir / f"{tag}_{sample_path.stem}.mkv"
+            try:
+                if not encode_sample(sample_path, candidate, args.codec, crf, args.preset):
+                    return None
+                try:
+                    return run_vmaf(reference=sample_path, distorted=candidate)
+                except ProbeError:
+                    return None
+            finally:
                 candidate.unlink(missing_ok=True)
-            if not scores:
-                log(f"  generation {generation}/{args.tune_generations}: CRF {crf} -- all sample encodes failed, stopping")
-                break
-            aggregate = min(scores)  # worst-of-samples: a floor guarantee, not an average
-            trials.append((crf, aggregate))
-            meets_target = aggregate >= args.target_vmaf - args.tune_tolerance
-            log(f"  generation {generation}/{args.tune_generations}: CRF {crf} -> worst-sample VMAF {aggregate:.1f} "
-                f"({'meets' if meets_target else 'below'} target {args.target_vmaf:.1f})")
-            if meets_target and (best is None or crf > best[0]):
-                best = (crf, aggregate)
-            if abs(aggregate - args.target_vmaf) <= args.tune_tolerance:
-                break
-            if meets_target:
-                lo = crf + 1  # target met -- try a higher CRF (smaller file) next
-            else:
-                hi = crf - 1  # target missed -- need a lower CRF (higher quality)
-            if lo > hi:
-                break
 
-        if best is None:
-            best = min(trials, key=lambda t: t[0]) if trials else (CRF_SEARCH_RANGE[args.codec][0], None)
-        chosen_crf, achieved = best
+        def bitrate_sample(sample_path, tag, crf):
+            """Encode one sample at `crf` and measure its bitrate; runs in a worker thread."""
+            candidate = tmp_dir / f"{tag}_{sample_path.stem}.mkv"
+            try:
+                if not encode_sample(sample_path, candidate, args.codec, crf, args.preset):
+                    return None
+                return measure_kbps(candidate)
+            finally:
+                candidate.unlink(missing_ok=True)
 
-        bitrates = []
-        for sample_path in sample_paths:
-            candidate = tmp_dir / f"final_{sample_path.stem}.mkv"
-            if encode_sample(sample_path, candidate, args.codec, chosen_crf, args.preset):
-                kbps = measure_kbps(candidate)
-                if kbps:
-                    bitrates.append(kbps)
-            candidate.unlink(missing_ok=True)
+        workers = max(1, min(len(sample_paths), args.jobs))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            trials, best = [], None
+            for generation in range(1, args.tune_generations + 1):
+                crf = (lo + hi) // 2
+                tag = f"g{generation}"
+                futures = [pool.submit(score_sample, sample_path, tag, crf) for sample_path in sample_paths]
+                scores = [f.result() for f in futures]
+                scores = [s for s in scores if s is not None]
+                if not scores:
+                    log(f"  generation {generation}/{args.tune_generations}: CRF {crf} -- all sample encodes failed, stopping")
+                    break
+                aggregate = min(scores)  # worst-of-samples: a floor guarantee, not an average
+                trials.append((crf, aggregate))
+                meets_target = aggregate >= args.target_vmaf - args.tune_tolerance
+                log(f"  generation {generation}/{args.tune_generations}: CRF {crf} -> worst-sample VMAF {aggregate:.1f} "
+                    f"({len(scores)} sample(s) concurrently, {'meets' if meets_target else 'below'} target {args.target_vmaf:.1f})")
+                if meets_target and (best is None or crf > best[0]):
+                    best = (crf, aggregate)
+                if abs(aggregate - args.target_vmaf) <= args.tune_tolerance:
+                    break
+                if meets_target:
+                    lo = crf + 1  # target met -- try a higher CRF (smaller file) next
+                else:
+                    hi = crf - 1  # target missed -- need a lower CRF (higher quality)
+                if lo > hi:
+                    break
+
+            if best is None:
+                best = min(trials, key=lambda t: t[0]) if trials else (CRF_SEARCH_RANGE[args.codec][0], None)
+            chosen_crf, achieved = best
+
+            futures = [pool.submit(bitrate_sample, sample_path, "final", chosen_crf) for sample_path in sample_paths]
+            bitrates = [kbps for kbps in (f.result() for f in futures) if kbps]
         maxrate_kbps = int(max(bitrates) * TUNE_MAXRATE_HEADROOM) if bitrates else None
 
         return chosen_crf, maxrate_kbps, {

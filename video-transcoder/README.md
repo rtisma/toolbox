@@ -64,7 +64,7 @@ given — `myfile.mov` becomes `myfile.converted.mp4`.
 | `--target-vmaf` | off (bare flag: `93.0`) | auto-discover `--crf`/`--maxrate` for this VMAF target (see "Auto-tuning quality" below) |
 | `--dry-run` | off | print the planned ffmpeg command(s) without running them |
 | `--compare`/`--no-compare` | on | after encoding, score the output against the source with VMAF |
-| `-j/--jobs` | `4` | directory mode: how many files to convert concurrently |
+| `-j/--jobs` | `4` | directory mode: how many files to convert concurrently; also caps how many `--target-vmaf` sample clips are encoded/scored concurrently per generation |
 | `-r/--report` | `<directory>/conversion-report.json` | directory mode: where to write the JSON report |
 | `--retries` | `0` | retry a failed conversion this many times before giving up |
 | `--slack-bot-token` | `$SLACK_BOT_TOKEN` | Slack bot token; notification is disabled unless this and `--slack-channel` are both set |
@@ -219,15 +219,18 @@ the fixed `--crf`/`--maxrate` defaults, it:
    `--tune-sample-duration`) via fast stream-copy from evenly-spaced points
    across the middle 80% of the input (skipping likely intro/outro).
 2. Binary-searches CRF: each generation (default: up to 6 —
-   `--tune-generations`) encodes every sample at one candidate CRF and takes
-   the **worst** (not average) VMAF across samples — a floor guarantee, not
-   just a typical case. If that meets the target (within `--tune-tolerance`,
-   default 1.0), the search tries a higher CRF (smaller file) next;
-   otherwise a lower one (higher quality). This converges on the highest
-   CRF — smallest file — that still meets the target everywhere sampled.
-3. Once CRF converges, re-encodes the samples at that CRF once more to
-   measure their actual bitrate, and derives `--maxrate` from it (1.5x
-   headroom) instead of the fixed per-resolution table.
+   `--tune-generations`) encodes every sample at one candidate CRF —
+   concurrently, up to `--jobs` at a time — and takes the **worst** (not
+   average) VMAF across samples as the generation's score, a floor
+   guarantee rather than a typical case. If that meets the target (within
+   `--tune-tolerance`, default 1.0), the search tries a higher CRF (smaller
+   file) next; otherwise a lower one (higher quality). This converges on
+   the highest CRF — smallest file — that still meets the target everywhere
+   sampled.
+3. Once CRF converges, re-encodes the samples at that CRF once more
+   (again concurrently) to measure their actual bitrate, and derives
+   `--maxrate` from it (1.5x headroom) instead of the fixed per-resolution
+   table.
 
 The discovered CRF/maxrate are then used for the real conversion, exactly
 as if you'd passed `--crf`/`--maxrate` yourself — mutually exclusive with
