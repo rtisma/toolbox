@@ -36,6 +36,9 @@ python3 video-transcoder.py check-libvmaf
 
 # source is on an NFS mount: read from there, write output to local disk
 python3 video-transcoder.py /mnt/nfs/videos/clip.mov --nfs
+
+# don't know the right CRF for this content? auto-discover it (see "Auto-tuning quality" below)
+python3 video-transcoder.py ./videos/ --target-vmaf 93
 ```
 
 Three subcommands: `convert` (conversion — the default, so `video-transcoder.py input.mov` is short for
@@ -56,6 +59,9 @@ given — `myfile.mov` becomes `myfile.converted.mp4`.
 | `--height` | source height | downscale (e.g. `720`, `480`, `360`) |
 | `--crf` | `23` (h264) / `20` (h265) | lower = higher quality/bigger file |
 | `--preset` | `slow` (h264) / `slow` (h265) | encoder speed/efficiency tradeoff |
+| `--maxrate` | auto by resolution | override the `-maxrate` safety ceiling in kbps |
+| `--uncapped` | off | drop `-maxrate`/`-bufsize` entirely; CRF alone controls bitrate |
+| `--target-vmaf` | off (bare flag: `93.0`) | auto-discover `--crf`/`--maxrate` for this VMAF target (see "Auto-tuning quality" below) |
 | `--dry-run` | off | print the planned ffmpeg command(s) without running them |
 | `--compare`/`--no-compare` | on | after encoding, score the output against the source with VMAF |
 | `-j/--jobs` | `4` | directory mode: how many files to convert concurrently |
@@ -197,6 +203,49 @@ file, releasing the claim once that file's conversion finishes (success or
 failure). It's still a snapshot-based check, not a filesystem-level
 reservation — actual usage can differ slightly from a file's declared size
 — but it prevents the concurrent-approval race, not just a single-file one.
+
+## Auto-tuning quality
+
+```bash
+python3 video-transcoder.py input.mov --target-vmaf 93
+python3 video-transcoder.py ./videos/ --target-vmaf 90 --tune-samples 4 --tune-generations 8
+```
+
+Picking a CRF by hand means guessing, converting, checking VMAF, and
+adjusting — exactly the loop `--target-vmaf` automates. Instead of using
+the fixed `--crf`/`--maxrate` defaults, it:
+
+1. Extracts a few short sample clips (default: 3, 6s each — `--tune-samples`/
+   `--tune-sample-duration`) via fast stream-copy from evenly-spaced points
+   across the middle 80% of the input (skipping likely intro/outro).
+2. Binary-searches CRF: each generation (default: up to 6 —
+   `--tune-generations`) encodes every sample at one candidate CRF and takes
+   the **worst** (not average) VMAF across samples — a floor guarantee, not
+   just a typical case. If that meets the target (within `--tune-tolerance`,
+   default 1.0), the search tries a higher CRF (smaller file) next;
+   otherwise a lower one (higher quality). This converges on the highest
+   CRF — smallest file — that still meets the target everywhere sampled.
+3. Once CRF converges, re-encodes the samples at that CRF once more to
+   measure their actual bitrate, and derives `--maxrate` from it (1.5x
+   headroom) instead of the fixed per-resolution table.
+
+The discovered CRF/maxrate are then used for the real conversion, exactly
+as if you'd passed `--crf`/`--maxrate` yourself — mutually exclusive with
+those flags for that reason. Requires `libvmaf` (checked up front, like
+`--compare`) regardless of whether `--no-compare` is also set, since the
+search itself depends on VMAF even if you don't want a final check.
+
+**In directory mode, tuning runs once, against the first file** — not
+per file. This is deliberate: comprehensively tuning every file in a
+100-file batch would mean 100x the sampling/search cost. If the files come
+from the same recording session or device (the common case for a batch),
+one file's tuned settings are a reasonable estimate for the rest. If your
+batch is genuinely heterogeneous, tune each file individually instead:
+`--target-vmaf` on a single file at a time, or pick the settings it finds
+and pass them explicitly per subset via `--crf`/`--maxrate`.
+
+`--dry-run` skips the actual search (it's real encode-and-compare work,
+not free) and just prints what tuning would target and reuse.
 
 ## Checking for / adding libvmaf
 

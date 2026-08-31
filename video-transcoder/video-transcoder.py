@@ -24,6 +24,16 @@ proceed without it. Use "check-libvmaf" to check this directly, and
 "compare" to VMAF-score a file you've already converted, without
 re-running any conversion.
 
+--target-vmaf auto-discovers --crf (and a derived --maxrate) instead of
+using the fixed defaults: it extracts a few short sample clips from across
+the input, binary-searches CRF against them for the highest value (smallest
+file) that still meets the target VMAF, then measures the tuned CRF's
+actual bitrate to derive a sane --maxrate. In directory mode this runs
+once, against the first file, and the result is applied to the whole
+batch — not re-tuned per file — since files from the same recording
+session/device are usually similar enough that one file's tuned settings
+are a good estimate for the rest.
+
 Three subcommands: "convert" (the default — implied if the first argument
 isn't "convert", "compare", or "check-libvmaf"), "compare", "check-libvmaf".
 
@@ -37,6 +47,7 @@ isn't "convert", "compare", or "check-libvmaf"), "compare", "check-libvmaf".
     python3 video-transcoder.py compare input.mov input.converted.mp4
     python3 video-transcoder.py check-libvmaf
     python3 video-transcoder.py /mnt/nfs/videos/clip.mov --nfs
+    python3 video-transcoder.py ./videos/ --target-vmaf 93
 """
 
 import argparse
@@ -87,6 +98,9 @@ DEFAULT_CRF = {"h264": 23, "h265": 20}  # h265: lower than h264's 23 -- x265's C
                                           # a few points "harsher" than x264's at the same number
 DEFAULT_PRESET = {"h264": "slow", "h265": "slow"}
 ENCODER = {"h264": "libx264", "h265": "libx265"}
+
+CRF_SEARCH_RANGE = {"h264": (15, 32), "h265": (12, 32)}  # bounds for --target-vmaf's binary search
+TUNE_MAXRATE_HEADROOM = 1.5  # multiplier applied to the tuned CRF's observed sample bitrate
 
 
 class ProbeError(RuntimeError):
@@ -357,17 +371,144 @@ def discover_videos(directory):
     )
 
 
+def pick_sample_starts(duration, count):
+    """Evenly space `count` sample start times across the middle 80% of `duration`,
+    avoiding likely intro/outro (black frames, fades, credits) at either end."""
+    if not duration or duration <= 0 or count <= 1:
+        return [max((duration or 0.0) * 0.1, 0.0) for _ in range(max(count, 1))]
+    margin = duration * 0.1
+    usable = max(duration - 2 * margin, 0.0)
+    return [margin + usable * i / (count - 1) for i in range(count)]
+
+
+def extract_sample(input_path, start, duration, dest):
+    """Fast stream-copy extraction of a short clip for tuning; no re-encode."""
+    cmd = ["ffmpeg", "-y", "-ss", f"{start:.2f}", "-i", str(input_path), "-t", f"{duration:.2f}",
+           "-c", "copy", "-avoid_negative_ts", "make_zero", str(dest)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0 and dest.exists() and dest.stat().st_size > 0
+
+
+def encode_sample(sample_path, dest, codec, crf, preset, maxrate_kbps=None):
+    cmd = ["ffmpeg", "-y", "-i", str(sample_path), "-an", "-c:v", ENCODER[codec], "-preset", preset, "-crf", str(crf)]
+    if maxrate_kbps:
+        cmd += ["-maxrate", f"{maxrate_kbps}k", "-bufsize", f"{maxrate_kbps * 2}k"]
+    cmd.append(str(dest))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0 and dest.exists() and dest.stat().st_size > 0
+
+
+def measure_kbps(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=bit_rate,duration", "-of", "default=noprint_wrappers=1"]
+        + [str(path)],
+        capture_output=True, text=True,
+    )
+    info = dict(line.partition("=")[::2] for line in result.stdout.strip().splitlines())
+    try:
+        return float(info["bit_rate"]) / 1000
+    except (KeyError, ValueError):
+        pass
+    try:
+        return path.stat().st_size * 8 / float(info["duration"]) / 1000
+    except (KeyError, ValueError, ZeroDivisionError):
+        return None
+
+
+def auto_tune_quality(input_path, args, duration, log=print):
+    """Binary-search for the highest CRF (smallest file) that still hits args.target_vmaf,
+    using short sample clips from across input_path, then derive a maxrate from the
+    tuned CRF's observed sample bitrate. Returns (crf, maxrate_kbps, info_dict)."""
+    lo, hi = CRF_SEARCH_RANGE[args.codec]
+    tmp_dir = Path(tempfile.mkdtemp(prefix="vt-tune-"))
+    try:
+        starts = pick_sample_starts(duration, args.tune_samples)
+        cap = max(duration - args.tune_sample_duration, 0.0) if duration else None
+        starts = [max(0.0, min(s, cap)) if cap is not None else s for s in starts]
+
+        sample_paths = []
+        for i, start in enumerate(starts):
+            dest = tmp_dir / f"sample{i}.mkv"
+            if extract_sample(input_path, start, args.tune_sample_duration, dest):
+                sample_paths.append(dest)
+        if not sample_paths:
+            log("  could not extract any sample clips -- falling back to the default CRF")
+            return DEFAULT_CRF[args.codec], None, {"tuned": False, "reason": "no samples extracted"}
+        log(f"  extracted {len(sample_paths)} sample clip(s) (~{args.tune_sample_duration:.0f}s each)")
+
+        trials, best = [], None
+        for generation in range(1, args.tune_generations + 1):
+            crf = (lo + hi) // 2
+            scores = []
+            for sample_path in sample_paths:
+                candidate = tmp_dir / f"g{generation}_{sample_path.stem}.mkv"
+                if encode_sample(sample_path, candidate, args.codec, crf, args.preset):
+                    try:
+                        scores.append(run_vmaf(reference=sample_path, distorted=candidate))
+                    except ProbeError:
+                        pass
+                candidate.unlink(missing_ok=True)
+            if not scores:
+                log(f"  generation {generation}/{args.tune_generations}: CRF {crf} -- all sample encodes failed, stopping")
+                break
+            aggregate = min(scores)  # worst-of-samples: a floor guarantee, not an average
+            trials.append((crf, aggregate))
+            meets_target = aggregate >= args.target_vmaf - args.tune_tolerance
+            log(f"  generation {generation}/{args.tune_generations}: CRF {crf} -> worst-sample VMAF {aggregate:.1f} "
+                f"({'meets' if meets_target else 'below'} target {args.target_vmaf:.1f})")
+            if meets_target and (best is None or crf > best[0]):
+                best = (crf, aggregate)
+            if abs(aggregate - args.target_vmaf) <= args.tune_tolerance:
+                break
+            if meets_target:
+                lo = crf + 1  # target met -- try a higher CRF (smaller file) next
+            else:
+                hi = crf - 1  # target missed -- need a lower CRF (higher quality)
+            if lo > hi:
+                break
+
+        if best is None:
+            best = min(trials, key=lambda t: t[0]) if trials else (CRF_SEARCH_RANGE[args.codec][0], None)
+        chosen_crf, achieved = best
+
+        bitrates = []
+        for sample_path in sample_paths:
+            candidate = tmp_dir / f"final_{sample_path.stem}.mkv"
+            if encode_sample(sample_path, candidate, args.codec, chosen_crf, args.preset):
+                kbps = measure_kbps(candidate)
+                if kbps:
+                    bitrates.append(kbps)
+            candidate.unlink(missing_ok=True)
+        maxrate_kbps = int(max(bitrates) * TUNE_MAXRATE_HEADROOM) if bitrates else None
+
+        return chosen_crf, maxrate_kbps, {
+            "tuned": True,
+            "target_vmaf": args.target_vmaf,
+            "achieved_vmaf": achieved,
+            "generations_run": len(trials),
+            "trials": trials,
+            "samples": len(sample_paths),
+            "maxrate_kbps": maxrate_kbps,
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def build_command(input_path, output_path, args, target_height, fps):
-    cap_kbps = pick_bitrate_cap(args.codec, target_height, fps)
+    if args.uncapped:
+        cap_kbps = None
+    elif args.maxrate:
+        cap_kbps = args.maxrate
+    else:
+        cap_kbps = pick_bitrate_cap(args.codec, target_height, fps)
+
     cmd = ["ffmpeg", "-y", "-i", str(input_path)]
     if args.height:
         cmd += ["-vf", f"scale=-2:{args.height}"]
+    cmd += ["-c:v", ENCODER[args.codec], "-preset", args.preset, "-crf", str(args.crf)]
+    if cap_kbps is not None:
+        cmd += ["-maxrate", f"{cap_kbps}k", "-bufsize", f"{cap_kbps * 2}k"]
     cmd += [
-        "-c:v", ENCODER[args.codec],
-        "-preset", args.preset,
-        "-crf", str(args.crf),
-        "-maxrate", f"{cap_kbps}k",
-        "-bufsize", f"{cap_kbps * 2}k",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
     ]
@@ -617,8 +758,30 @@ def build_parser():
                                "(default: alongside each source, named <basename>.converted.mp4)")
     convert.add_argument("-c", "--codec", choices=["h265", "h264"], default="h265")
     convert.add_argument("--height", type=int, help="downscale to this height (e.g. 480, 720); default: keep source resolution")
-    convert.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 20)")
+    convert.add_argument("--crf", type=int, help="override default CRF (h264: 23, h265: 20); lower = higher quality")
     convert.add_argument("--preset", help="override default encoder preset (h264: slow, h265: slow)")
+    convert.add_argument("--maxrate", type=int,
+                          help="override the auto-computed -maxrate safety ceiling, in kbps (default: picked by "
+                               "resolution; see BITRATE_KBPS). Raise this if VMAF is still low on demanding "
+                               "content even after lowering --crf -- the cap may be binding")
+    convert.add_argument("--uncapped", action="store_true",
+                          help="drop the -maxrate/-bufsize ceiling entirely; CRF alone controls bitrate with no "
+                               "limit. Strongest quality guarantee, but can produce very large files on complex "
+                               "content. Mutually exclusive with --maxrate")
+    convert.add_argument("--target-vmaf", type=float, nargs="?", const=93.0, default=None,
+                          help="auto-discover --crf (and a derived --maxrate) by sampling short clips from across "
+                               "the input and binary-searching for the CRF that hits this VMAF (bare flag defaults "
+                               "to 93.0). In directory mode, tuning runs once against the first file and the "
+                               "result is reused for the whole batch -- not re-tuned per file. Requires libvmaf. "
+                               "Mutually exclusive with --crf/--maxrate/--uncapped")
+    convert.add_argument("--tune-generations", type=int, default=6,
+                          help="max binary-search iterations for --target-vmaf (default: 6)")
+    convert.add_argument("--tune-samples", type=int, default=3,
+                          help="number of sample clips tested per generation for --target-vmaf (default: 3)")
+    convert.add_argument("--tune-sample-duration", type=float, default=6.0,
+                          help="duration in seconds of each --target-vmaf sample clip (default: 6.0)")
+    convert.add_argument("--tune-tolerance", type=float, default=1.0,
+                          help="acceptable VMAF deviation from --target-vmaf before the search stops (default: 1.0)")
     convert.add_argument("--dry-run", action="store_true", help="print the planned ffmpeg command(s) without running them")
     convert.add_argument("--compare", action=argparse.BooleanOptionalAction, default=True,
                           help="after encoding, compute the VMAF score against the source (default: on; use --no-compare to skip)")
@@ -660,6 +823,20 @@ def parse_args(argv):
             convert.error("--jobs must be >= 1")
         if args.retries < 0:
             convert.error("--retries must be >= 0")
+        if args.maxrate and args.uncapped:
+            convert.error("--maxrate and --uncapped are mutually exclusive")
+        if args.maxrate is not None and args.maxrate < 1:
+            convert.error("--maxrate must be >= 1")
+        if args.target_vmaf is not None:
+            if args.crf is not None or args.maxrate is not None or args.uncapped:
+                convert.error("--target-vmaf can't be combined with --crf/--maxrate/--uncapped "
+                               "(it discovers them automatically)")
+            if args.tune_samples < 1:
+                convert.error("--tune-samples must be >= 1")
+            if args.tune_generations < 1:
+                convert.error("--tune-generations must be >= 1")
+            if args.tune_sample_duration <= 0:
+                convert.error("--tune-sample-duration must be > 0")
         if args.crf is None:
             args.crf = DEFAULT_CRF[args.codec]
         if args.preset is None:
@@ -725,19 +902,39 @@ def main(argv=None):
     if args.subcommand == "check-libvmaf":
         return run_check_libvmaf()
 
-    if args.compare:
-        require_libvmaf_or_exit()
+    if args.compare or args.target_vmaf is not None:
+        require_libvmaf_or_exit(suggest_no_compare=args.target_vmaf is None)
 
     if bool(args.slack_bot_token) != bool(args.slack_channel):
         missing = "--slack-channel" if args.slack_bot_token else "--slack-bot-token"
         print(f"warning: Slack notification disabled -- {missing} not set", file=sys.stderr)
 
-    if args.input.is_dir():
-        files = discover_videos(args.input)
-        if not files:
-            print(f"no video files found in {args.input}")
-            return 0
+    files = discover_videos(args.input) if args.input.is_dir() else None
+    if files is not None and not files:
+        print(f"no video files found in {args.input}")
+        return 0
 
+    if args.target_vmaf is not None:
+        tune_target = files[0] if files else args.input
+        if args.dry_run:
+            print(f"--target-vmaf {args.target_vmaf}: would tune CRF/maxrate using {tune_target} "
+                  f"({args.tune_samples} sample(s), up to {args.tune_generations} generation(s)) and apply "
+                  "the result to " + ("the whole batch" if files else "this file"))
+        else:
+            print(f"tuning quality using {tune_target} (target VMAF {args.target_vmaf}, up to "
+                  f"{args.tune_generations} generation(s), {args.tune_samples} sample(s))...")
+            _, _, tune_duration = probe_video(tune_target)
+            crf, maxrate_kbps, tune_info = auto_tune_quality(tune_target, args, tune_duration)
+            if tune_info.get("tuned"):
+                rate_desc = f"maxrate={maxrate_kbps}kbps" if maxrate_kbps else "uncapped"
+                print(f"tuned: CRF={crf}, {rate_desc} (worst-sample VMAF {tune_info['achieved_vmaf']:.1f} "
+                      f"after {tune_info['generations_run']} generation(s))")
+            else:
+                print(f"tuning failed ({tune_info.get('reason', 'unknown')}) -- using default CRF={crf}")
+            args.crf, args.maxrate, args.uncapped = crf, maxrate_kbps, False
+        args.target_vmaf = None  # resolved -- downstream treats crf/maxrate as if passed explicitly
+
+    if files is not None:
         output_dir = args.output or (NFS_LOCAL_DIR if args.nfs else args.input)
         report_path = args.report or (args.input / "conversion-report.json")
 
