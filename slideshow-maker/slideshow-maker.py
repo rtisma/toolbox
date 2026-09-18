@@ -6,7 +6,8 @@ Subcommands, meant to be run in order:
   check          Report which system dependencies are installed.
   generate-list  Build an ordered CSV list of media paths + capture
                  datetimes (sorted by filename, descending, or
-                 randomized). Edit the resulting file freely before
+                 randomized; optionally deduplicated by exact file
+                 content). Edit the resulting file freely before
                  moving on.
   annotate       (optional) Burn each item's capture date/time (from
                  the CSV, or file mtime if blank) into its bottom-right
@@ -41,6 +42,7 @@ a list that mixes videos with images is not yet supported.
 import argparse
 import csv
 import glob
+import hashlib
 import os
 import random
 import shlex
@@ -233,6 +235,30 @@ def video_duration_str(path: str) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def file_sha256(path: str, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dedupe_files(files: list[str]) -> list[str]:
+    """Drop files whose content exactly matches one already kept (first
+    occurrence wins), reporting each skip to stderr."""
+    seen_hashes: dict[str, str] = {}
+    deduped = []
+    for f in files:
+        digest = file_sha256(f)
+        original = seen_hashes.get(digest)
+        if original is not None:
+            print(f"Skipping duplicate of {original}: {f}", file=sys.stderr)
+            continue
+        seen_hashes[digest] = f
+        deduped.append(f)
+    return deduped
+
+
 def cmd_generate_list(args: argparse.Namespace) -> None:
     ensure_deps("generate-list", args.skip_checks)
 
@@ -251,6 +277,11 @@ def cmd_generate_list(args: argparse.Namespace) -> None:
 
     if not files:
         sys.exit(f"error: no files matched '{args.glob}' in {input_dir}")
+
+    if args.dedupe:
+        files = dedupe_files(files)
+        if not files:
+            sys.exit(f"error: no files left after deduplication in {input_dir}")
 
     if args.random:
         random.shuffle(files)
@@ -481,12 +512,14 @@ def build_parser() -> argparse.ArgumentParser:
             "then CreateDate) and left blank if neither is present. For video "
             "files, start_time/end_time are pre-filled to the clip's full range "
             "(00:00:00 to its duration) so you can crop the numbers down by hand; "
-            "left blank for still images."
+            "left blank for still images. --dedupe drops any file whose content "
+            "exactly matches one already kept."
         ),
         epilog=(
             "Examples:\n"
             "  slideshow.py generate-list -i ~/Pictures/trip -o list.csv -R\n"
-            "  slideshow.py generate-list -i ~/Pictures/trip -g \"*.jpg,*.mp4\" -o list.csv"
+            "  slideshow.py generate-list -i ~/Pictures/trip -g \"*.jpg,*.mp4\" -o list.csv\n"
+            "  slideshow.py generate-list -i ~/Pictures/trip -o list.csv --dedupe"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -494,6 +527,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_gen.add_argument("-g", "--glob", default="*.jpg", help="Comma-separated glob(s), e.g. \"*.jpg,*.mp4\" (default: *.jpg)")
     p_gen.add_argument("-o", "--output", default="list.csv", help="Output CSV list file (default: list.csv)")
     p_gen.add_argument("-R", "--random", action="store_true", help="Randomize order (default: sort by filename, descending)")
+    p_gen.add_argument("-D", "--dedupe", action="store_true", help="Skip files whose content exactly matches one already kept (first occurrence wins)")
     p_gen.add_argument("-F", "--date-format", default="%Y-%m-%d %H:%M", help="exiftool/strftime date format")
     p_gen.add_argument("--skip-checks", action="store_true", help="Skip the dependency check before running")
     p_gen.set_defaults(func=cmd_generate_list)
