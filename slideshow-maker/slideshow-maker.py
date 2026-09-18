@@ -5,31 +5,32 @@ Subcommands, meant to be run in order:
 
   check          Report which system dependencies are installed.
   generate-list  Build an ordered CSV list of media paths + capture
-                 datetimes (sorted by filename, descending, or
-                 randomized; optionally deduplicated by exact file
-                 content). Edit the resulting file freely before
-                 moving on.
-  annotate       (optional) Burn each item's capture date/time (from
-                 the CSV, or file mtime if blank) into its bottom-right
+                 dates (sorted by filename, descending, or randomized;
+                 optionally deduplicated by exact file content). Edit
+                 the resulting file freely before moving on.
+  annotate       (optional) Burn each item's capture date (from the
+                 CSV, or file mtime if blank) into its bottom-right
                  corner. Works on still images and video clips.
   render         Render an mp4 from a list, N seconds per image, with
                  an optional crossfade between images. Pass --annotate
                  to burn dates in as part of rendering.
 
-The list is a CSV with five columns: filename (required), datetime,
-filename_datetime, start_time, end_time (all optional). datetime comes
-from exiftool; if that finds nothing, generate-list falls back to an
-8-digit YYYYMMDD run in the filename (e.g. "20191028" -> October 28th
-2019) and puts it in filename_datetime instead -- the two are mutually
-exclusive, and a row with both set is an error. If both are blank,
-annotate/render --annotate fall back to the file's mtime. start_time/
-end_time trim a video clip (ignored for still images); generate-list
-pre-fills them to the clip's full range (00:00:00 to its duration) so
-you can just crop the numbers down by hand. If you blank start_time
-back out while end_time is set, it defaults back to 00:00:00; if you
-blank end_time back out while start_time is set, the clip runs to its
-natural end. A row whose filename starts with '#' is treated as a
-comment and skipped.
+The list is a CSV with five columns: filename (required),
+exif_datestamp, filename_datestamp, start_time, end_time (all
+optional). Only the date matters here, not the time of day.
+exif_datestamp comes from exiftool; if that finds nothing,
+generate-list falls back to an 8-digit YYYYMMDD run in the filename
+(e.g. "20191028" -> October 28th 2019) and puts it in
+filename_datestamp instead -- the two are mutually exclusive, and a
+row with both set is an error. If both are blank, annotate/render
+--annotate fall back to the file's mtime. start_time/end_time trim a
+video clip (ignored for still images); generate-list pre-fills them to
+the clip's full range (00:00:00 to its duration) so you can just crop
+the numbers down by hand. If you blank start_time back out while
+end_time is set, it defaults back to 00:00:00; if you blank end_time
+back out while start_time is set, the clip runs to its natural end. A
+row whose filename starts with '#' is treated as a comment and
+skipped.
 
 Dependencies: ffmpeg (and ffprobe) on PATH for `render`/`generate-list`;
 exiftool on PATH for `generate-list`; ffmpeg and a running docker
@@ -70,7 +71,7 @@ RUN apt-get update \\
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg"}
 
-LIST_HEADER = ["filename", "datetime", "filename_datetime", "start_time", "end_time"]
+LIST_HEADER = ["filename", "exif_datestamp", "filename_datestamp", "start_time", "end_time"]
 
 # 8 digits not adjacent to another digit, e.g. "IMG_20191028_143022.jpg" -> "20191028".
 FILENAME_DATE_RE = re.compile(r"(?<!\d)(\d{8})(?!\d)")
@@ -163,10 +164,10 @@ def write_list_csv(path: Path, rows: list[tuple[str, str, str, str, str]]) -> No
 
 
 def read_list_csv(path: Path) -> list[tuple[str, str, str, str, str]]:
-    """Return (filename, datetime, filename_datetime, start_time, end_time)
-    for every real (non-comment) row. Verifies files exist. datetime and
-    filename_datetime are mutually exclusive -- a row with both set is an
-    error, since it's ambiguous which one the tool should trust."""
+    """Return (filename, exif_datestamp, filename_datestamp, start_time,
+    end_time) for every real (non-comment) row. Verifies files exist.
+    exif_datestamp and filename_datestamp are mutually exclusive -- a row
+    with both set is an error, since it's ambiguous which one to trust."""
     if not path.is_file():
         sys.exit(f"error: list file not found: {path}")
     rows = []
@@ -180,18 +181,18 @@ def read_list_csv(path: Path) -> list[tuple[str, str, str, str, str]]:
                 continue
             if not filename or filename.startswith("#"):
                 continue
-            dt = row[1].strip() if len(row) > 1 else ""
-            fn_dt = row[2].strip() if len(row) > 2 else ""
+            exif_ds = row[1].strip() if len(row) > 1 else ""
+            filename_ds = row[2].strip() if len(row) > 2 else ""
             start = row[3].strip() if len(row) > 3 else ""
             end = row[4].strip() if len(row) > 4 else ""
-            if dt and fn_dt:
+            if exif_ds and filename_ds:
                 sys.exit(
-                    f"error: {filename} has both datetime and filename_datetime set; "
+                    f"error: {filename} has both exif_datestamp and filename_datestamp set; "
                     f"only one may be present"
                 )
             if not os.path.isfile(filename):
                 sys.exit(f"error: missing file: {filename}")
-            rows.append((filename, dt, fn_dt, start, end))
+            rows.append((filename, exif_ds, filename_ds, start, end))
     if not rows:
         sys.exit(f"error: no entries found in {path}")
     return rows
@@ -218,7 +219,7 @@ def scale_pad_filter(resolution: str) -> str:
 
 # --- generate-list -----------------------------------------------------------
 
-def exif_datetime(path: str, fmt: str) -> str:
+def exif_datestamp(path: str, fmt: str) -> str:
     """Try DateTimeOriginal then CreateDate via exiftool. Returns '' if neither
     is present (some containers, e.g. mp4/QuickTime, use an all-zero sentinel
     for "unset" rather than omitting the tag, so that's treated as absent too).
@@ -239,11 +240,10 @@ def exif_datetime(path: str, fmt: str) -> str:
     return ""
 
 
-def filename_datetime(path: str, fmt: str) -> str:
+def filename_datestamp(path: str, fmt: str) -> str:
     """Look for an 8-digit YYYYMMDD run in the filename (e.g. "20191028" ->
-    October 28th 2019) and return it formatted per fmt, with time fields
-    (if any in fmt) at midnight since the filename carries no time. Returns
-    '' if no 8-digit run in the name parses as a valid date."""
+    October 28th 2019) and return it formatted per fmt. Returns '' if no
+    8-digit run in the name parses as a valid date."""
     name = Path(path).stem
     for match in FILENAME_DATE_RE.finditer(name):
         try:
@@ -321,12 +321,12 @@ def cmd_generate_list(args: argparse.Namespace) -> None:
 
     rows = []
     for f in files:
-        dt = exif_datetime(f, args.date_format)
-        fn_dt = "" if dt else filename_datetime(f, args.date_format)
+        exif_ds = exif_datestamp(f, args.date_format)
+        filename_ds = "" if exif_ds else filename_datestamp(f, args.date_format)
         if is_video(f):
-            rows.append((f, dt, fn_dt, "00:00:00", video_duration_str(f)))
+            rows.append((f, exif_ds, filename_ds, "00:00:00", video_duration_str(f)))
         else:
-            rows.append((f, dt, fn_dt, "", ""))
+            rows.append((f, exif_ds, filename_ds, "", ""))
 
     out_path = Path(args.output)
     write_list_csv(out_path, rows)
@@ -380,8 +380,8 @@ def run_annotation(list_path: Path, out_dir: Path, date_format: str, font_size: 
     """Burn dates (and, for videos, trim to start_time/end_time) into copies
     of every real entry in list_path.
 
-    Returns (rows, count) where rows is [(dest_path, datetime, "", "", ""), ...]
-    -- filename_datetime/start/end come back blank because the resolved date
+    Returns (rows, count) where rows is [(dest_path, exif_datestamp, "", "", ""), ...]
+    -- filename_datestamp/start/end come back blank because the resolved date
     and trim are already baked into the output file -- suitable for writing
     a new CSV list or feeding directly into render.
     """
@@ -393,11 +393,11 @@ def run_annotation(list_path: Path, out_dir: Path, date_format: str, font_size: 
     batch_lines = []
     out_rows = []
 
-    for filename, dt, fn_dt, start, end in entries:
+    for filename, exif_ds, filename_ds, start, end in entries:
         src = Path(filename).resolve()
         mount_dirs.add(src.parent)
 
-        ts = dt or fn_dt
+        ts = exif_ds or filename_ds
         if not ts:
             ts = mtime_str(str(src), date_format)
             print(f"No capture date for {src}, using file mtime", file=sys.stderr)
@@ -537,17 +537,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_check.set_defaults(func=cmd_check)
 
     p_gen = sub.add_parser(
-        "generate-list", help="Build an ordered CSV list of media paths + capture datetimes",
+        "generate-list", help="Build an ordered CSV list of media paths + capture dates",
         description=(
-            "Build an ordered CSV list (filename,datetime,filename_datetime,"
-            "start_time,end_time) of media paths. datetime is extracted via "
+            "Build an ordered CSV list (filename,exif_datestamp,filename_datestamp,"
+            "start_time,end_time) of media paths. exif_datestamp is extracted via "
             "exiftool (DateTimeOriginal, then CreateDate); if neither is present, "
             "an 8-digit YYYYMMDD run in the filename (e.g. \"20191028\") is tried "
-            "instead and put in filename_datetime -- at most one of the two is "
-            "ever set. For video files, start_time/end_time are pre-filled to the "
-            "clip's full range (00:00:00 to its duration) so you can crop the "
-            "numbers down by hand; left blank for still images. --dedupe drops "
-            "any file whose content exactly matches one already kept."
+            "instead and put in filename_datestamp -- at most one of the two is "
+            "ever set. Only the date is kept, not the time of day. For video "
+            "files, start_time/end_time are pre-filled to the clip's full range "
+            "(00:00:00 to its duration) so you can crop the numbers down by hand; "
+            "left blank for still images. --dedupe drops any file whose content "
+            "exactly matches one already kept."
         ),
         epilog=(
             "Examples:\n"
@@ -562,28 +563,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_gen.add_argument("-o", "--output", default="list.csv", help="Output CSV list file (default: list.csv)")
     p_gen.add_argument("-R", "--random", action="store_true", help="Randomize order (default: sort by filename, descending)")
     p_gen.add_argument("-D", "--dedupe", action="store_true", help="Skip files whose content exactly matches one already kept (first occurrence wins)")
-    p_gen.add_argument("-F", "--date-format", default="%Y-%m-%d %H:%M", help="exiftool/strftime date format, e.g. %%Y-%%m-%%d is year-month-day -> 2024-01-31 (default: %%Y-%%m-%%d %%H:%%M -> 2024-01-31 14:05)")
+    p_gen.add_argument("-F", "--date-format", default="%Y-%m-%d", help="exiftool/strftime date-only format, e.g. %%Y-%%m-%%d is year-month-day (default: %%Y-%%m-%%d -> 2024-01-31)")
     p_gen.add_argument("--skip-checks", action="store_true", help="Skip the dependency check before running")
     p_gen.set_defaults(func=cmd_generate_list)
 
     p_annotate = sub.add_parser(
         "annotate", help="Burn each item's capture date into its bottom-right corner",
         description=(
-            "Burn the datetime column from a CSV list (falling back to file mtime "
-            "if blank) into the bottom-right corner of a copy of each item. Images "
-            "get a single annotated frame; videos are re-encoded with the date "
-            "burned into every frame and audio preserved, trimmed to start_time/"
-            "end_time if those columns are set (ignored for still images). The "
-            "text burn-in runs inside a small Docker container, since Homebrew's "
-            "ffmpeg build lacks the drawtext filter."
+            "Burn exif_datestamp/filename_datestamp from a CSV list (falling back "
+            "to file mtime if both are blank) into the bottom-right corner of a "
+            "copy of each item. Images get a single annotated frame; videos are "
+            "re-encoded with the date burned into every frame and audio "
+            "preserved, trimmed to start_time/end_time if those columns are set "
+            "(ignored for still images). The text burn-in runs inside a small "
+            "Docker container, since Homebrew's ffmpeg build lacks the drawtext "
+            "filter."
         ),
         epilog="Example: slideshow.py annotate -l list.csv -O ~/Pictures/trip_annotated",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_annotate.add_argument("-l", "--list", required=True, help="CSV list (filename,datetime,filename_datetime,start_time,end_time)")
+    p_annotate.add_argument("-l", "--list", required=True, help="CSV list (filename,exif_datestamp,filename_datestamp,start_time,end_time)")
     p_annotate.add_argument("-O", "--output-dir", required=True, help="Directory to write annotated copies into")
     p_annotate.add_argument("-o", "--output-list", help="Output CSV list file (default: <list>.annotated.csv)")
-    p_annotate.add_argument("-F", "--date-format", default="%Y-%m-%d %H:%M", help="strftime format for the mtime fallback, e.g. %%Y-%%m-%%d is year-month-day -> 2024-01-31 (default: %%Y-%%m-%%d %%H:%%M -> 2024-01-31 14:05)")
+    p_annotate.add_argument("-F", "--date-format", default="%Y-%m-%d", help="strftime date-only format for the mtime fallback (default: %%Y-%%m-%%d -> 2024-01-31)")
     p_annotate.add_argument("-s", "--font-size", type=int, default=28, help="Font size (default: 28)")
     p_annotate.add_argument("--skip-checks", action="store_true", help="Skip the dependency check before running")
     p_annotate.set_defaults(func=cmd_annotate)
@@ -598,7 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_render.add_argument("-l", "--list", required=True, help="CSV list (filename,datetime,filename_datetime,start_time,end_time)")
+    p_render.add_argument("-l", "--list", required=True, help="CSV list (filename,exif_datestamp,filename_datestamp,start_time,end_time)")
     p_render.add_argument("-o", "--output", required=True, help="Output mp4 path")
     p_render.add_argument("-d", "--duration", type=float, default=2, help="Seconds per image (default: 2)")
     p_render.add_argument("-r", "--resolution", default="1920x1080", help="Output resolution WxH (default: 1920x1080)")
@@ -606,7 +608,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("-c", "--crf", type=int, default=18, help="x264 CRF, lower = better/larger (default: 18)")
     p_render.add_argument("-p", "--preset", default="slow", help="x264 preset (default: slow)")
     p_render.add_argument("-a", "--annotate", action="store_true", help="Burn each photo's capture date into its bottom-right corner before rendering")
-    p_render.add_argument("-F", "--date-format", default="%Y-%m-%d %H:%M", help="strftime format for the mtime fallback, e.g. %%Y-%%m-%%d is year-month-day -> 2024-01-31 (default: %%Y-%%m-%%d %%H:%%M -> 2024-01-31 14:05; only used with --annotate)")
+    p_render.add_argument("-F", "--date-format", default="%Y-%m-%d", help="strftime date-only format for the mtime fallback (default: %%Y-%%m-%%d -> 2024-01-31; only used with --annotate)")
     p_render.add_argument("-s", "--font-size", type=int, default=28, help="Font size for the burned-in date (only used with --annotate, default: 28)")
     p_render.add_argument("--skip-checks", action="store_true", help="Skip the dependency check before running")
     p_render.set_defaults(func=cmd_render)
