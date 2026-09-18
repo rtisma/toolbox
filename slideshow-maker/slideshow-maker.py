@@ -8,9 +8,10 @@ Subcommands, meant to be run in order:
                  dates (sorted by filename, descending, or randomized;
                  optionally deduplicated by exact file content). Edit
                  the resulting file freely before moving on.
-  annotate       (optional) Burn each item's capture date (from the
-                 CSV, or file mtime if blank) into its bottom-right
-                 corner. Works on still images and video clips.
+  annotate       (optional) Burn each item's capture date from the
+                 CSV into its bottom-right corner; items with no date
+                 are copied through unannotated. Works on still images
+                 and video clips.
   render         Render an mp4 from a list, N seconds per image, with
                  an optional crossfade between images. Pass --annotate
                  to burn dates in as part of rendering.
@@ -23,8 +24,10 @@ generate-list falls back to an 8-digit YYYYMMDD run in the filename
 (e.g. "20191028" -> October 28th 2019) and puts it in
 filename_datestamp instead -- the two are mutually exclusive, and a
 row with both set is an error. If both are blank, annotate/render
---annotate fall back to the file's mtime. start_time/end_time trim a
-video clip (ignored for still images); generate-list pre-fills them to
+--annotate burn nothing in for that item (it's trimmed, if a video
+with start_time/end_time set, or otherwise copied through unchanged).
+start_time/end_time trim a video clip (ignored for still images);
+generate-list pre-fills them to
 the clip's full range (00:00:00 to its duration) so you can just crop
 the numbers down by hand. If you blank start_time back out while
 end_time is set, it defaults back to 00:00:00; if you blank end_time
@@ -33,10 +36,11 @@ row whose filename starts with '#' is treated as a comment and
 skipped.
 
 Dependencies: ffmpeg (and ffprobe) on PATH for `render`/`generate-list`;
-exiftool on PATH for `generate-list`; ffmpeg and a running docker
-daemon for `annotate` (the actual text burn-in runs inside a small
-Docker container, because Homebrew's ffmpeg build lacks the drawtext
-filter). Commands that need dependencies check them first; pass
+exiftool on PATH for `generate-list`; ffmpeg on PATH *with the drawtext
+filter compiled in* for `annotate` (Homebrew's default ffmpeg formula
+lacks it -- `check` reports this separately from plain ffmpeg
+presence; install a build with libfreetype, e.g. ffmpeg-full, if it's
+missing). Commands that need dependencies check them first; pass
 --skip-checks to bypass that.
 
 Note: render's per-item duration/crossfade logic assumes every list
@@ -51,23 +55,12 @@ import hashlib
 import os
 import random
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-
-DOCKER_IMAGE = "slideshow-ffmpeg-drawtext"
-
-DOCKERFILE = """\
-FROM debian:bookworm-slim
-
-RUN apt-get update \\
-    && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core \\
-    && rm -rf /var/lib/apt/lists/*
-"""
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg"}
 
@@ -93,27 +86,23 @@ def check_exiftool() -> tuple[bool, str]:
     return (path is not None, path or "not found on PATH")
 
 
-def check_docker_cli() -> tuple[bool, str]:
-    path = shutil.which("docker")
-    return (path is not None, path or "not found on PATH")
-
-
-def check_docker_daemon() -> tuple[bool, str]:
-    if shutil.which("docker") is None:
-        return (False, "docker CLI not found")
-    try:
-        result = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
-    except (subprocess.TimeoutExpired, OSError):
-        return (False, "daemon not reachable (is Docker running?)")
-    return (result.returncode == 0, "running" if result.returncode == 0 else "daemon not reachable (is Docker running?)")
+def check_ffmpeg_drawtext() -> tuple[bool, str]:
+    """annotate burns text in via ffmpeg's drawtext filter, which needs
+    ffmpeg built with libfreetype. Homebrew's default ffmpeg formula lacks
+    it (use ffmpeg-full, or a build with --enable-libfreetype)."""
+    if shutil.which("ffmpeg") is None:
+        return (False, "ffmpeg not found on PATH")
+    result = subprocess.run(["ffmpeg", "-h", "filter=drawtext"], capture_output=True, text=True)
+    if "Unknown filter" in result.stdout or "Unknown filter" in result.stderr:
+        return (False, "ffmpeg was built without the drawtext filter (needs libfreetype)")
+    return (True, "available")
 
 
 # (name, check function, commands that require it)
 CHECKS = [
     ("ffmpeg", check_ffmpeg, {"render", "annotate", "generate-list"}),
     ("exiftool", check_exiftool, {"generate-list"}),
-    ("docker CLI", check_docker_cli, {"annotate"}),
-    ("docker daemon", check_docker_daemon, {"annotate"}),
+    ("ffmpeg drawtext filter", check_ffmpeg_drawtext, {"annotate"}),
 ]
 
 
@@ -335,72 +324,73 @@ def cmd_generate_list(args: argparse.Namespace) -> None:
 
 # --- annotate ------------------------------------------------------------
 
-def mtime_str(path: str, fmt: str) -> str:
-    return datetime.fromtimestamp(os.path.getmtime(path)).strftime(fmt)
+# Checked in order; first one that exists on disk wins. Only macOS/Linux --
+# this tool has no Windows target.
+DEFAULT_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+]
 
 
-def drawtext_filter(ts: str, font_size: int) -> str:
+def default_font_file() -> str:
+    for candidate in DEFAULT_FONT_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def drawtext_filter(ts: str, font_size: int, font_file: str) -> str:
     # drawtext treats ':' as an option separator; escape it in the value.
     escaped_ts = ts.replace(":", r"\:")
-    return (
-        f"drawtext=text='{escaped_ts}':x=w-tw-20:y=h-th-20:"
-        f"fontsize={font_size}:"
-        f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:"
-        f"fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=8"
-    )
+    parts = [f"drawtext=text='{escaped_ts}'", "x=w-tw-20", "y=h-th-20", f"fontsize={font_size}"]
+    if font_file:
+        parts.append(f"fontfile={font_file}")
+    parts += ["fontcolor=white", "box=1", "boxcolor=black@0.5", "boxborderw=8"]
+    return ":".join(parts)
 
 
-def annotate_cmd(src: Path, dest: Path, ts: str, font_size: int, start: str, end: str) -> str:
-    vf = drawtext_filter(ts, font_size)
+def annotate_cmd(src: Path, dest: Path, ts: str, font_size: int, font_file: str, start: str, end: str) -> list[str]:
+    vf = drawtext_filter(ts, font_size, font_file) if ts else None
     if is_video(str(src)):
-        trim = ""
+        cmd = ["ffmpeg", "-y", "-i", str(src)]
         if start:
-            trim += f" -ss {shlex.quote(start)}"
+            cmd += ["-ss", start]
         if end:
-            trim += f" -to {shlex.quote(end)}"
-        return "ffmpeg -y -i {src}{trim} -vf {vf} -c:v libx264 -crf 18 -preset fast -c:a copy -movflags +faststart {dest} -loglevel error".format(
-            src=shlex.quote(str(src)), trim=trim, vf=shlex.quote(vf), dest=shlex.quote(str(dest)),
-        )
-    return "ffmpeg -y -i {src} -vf {vf} -frames:v 1 -q:v 2 {dest} -loglevel error".format(
-        src=shlex.quote(str(src)), vf=shlex.quote(vf), dest=shlex.quote(str(dest)),
-    )
+            cmd += ["-to", end]
+        if vf:
+            cmd += ["-vf", vf]
+        cmd += [
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:a", "copy", "-movflags", "+faststart",
+            str(dest), "-loglevel", "error",
+        ]
+        return cmd
+    # images only reach here with ts set -- the no-date/no-trim case is a
+    # plain copy, handled before this is called.
+    return ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-frames:v", "1", "-q:v", "2", str(dest), "-loglevel", "error"]
 
 
-def build_docker_image() -> None:
-    with tempfile.TemporaryDirectory() as build_dir:
-        dockerfile_path = Path(build_dir) / "Dockerfile"
-        dockerfile_path.write_text(DOCKERFILE)
-        subprocess.run(
-            ["docker", "build", "-q", "-t", DOCKER_IMAGE, "-f", str(dockerfile_path), build_dir],
-            check=True, stdout=subprocess.DEVNULL,
-        )
-
-
-def run_annotation(list_path: Path, out_dir: Path, date_format: str, font_size: int) -> tuple[list[tuple[str, str, str, str, str]], int]:
+def run_annotation(list_path: Path, out_dir: Path, font_size: int, font_file: str) -> tuple[list[tuple[str, str, str, str, str]], int]:
     """Burn dates (and, for videos, trim to start_time/end_time) into copies
-    of every real entry in list_path.
+    of every real entry in list_path. If an item has neither exif_datestamp
+    nor filename_datestamp, no text is burned in -- it's trimmed (if a video
+    with start_time/end_time set) or otherwise copied through unchanged.
 
     Returns (rows, count) where rows is [(dest_path, exif_datestamp, "", "", ""), ...]
     -- filename_datestamp/start/end come back blank because the resolved date
-    and trim are already baked into the output file -- suitable for writing
-    a new CSV list or feeding directly into render.
+    (if any) and trim are already baked into the output file -- suitable for
+    writing a new CSV list or feeding directly into render.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    build_docker_image()
 
     entries = read_list_csv(list_path)
-    mount_dirs = {out_dir}
-    batch_lines = []
     out_rows = []
 
     for filename, exif_ds, filename_ds, start, end in entries:
         src = Path(filename).resolve()
-        mount_dirs.add(src.parent)
-
         ts = exif_ds or filename_ds
-        if not ts:
-            ts = mtime_str(str(src), date_format)
-            print(f"No capture date for {src}, using file mtime", file=sys.stderr)
 
         start, end = resolve_trim(start, end)
         if (start or end) and not is_video(str(src)):
@@ -408,18 +398,14 @@ def run_annotation(list_path: Path, out_dir: Path, date_format: str, font_size: 
             start, end = "", ""
 
         dest = out_dir / src.name
-        batch_lines.append(annotate_cmd(src, dest, ts, font_size, start, end))
+        if not ts and not start and not end:
+            print(f"No capture date for {src}; copying without annotation", file=sys.stderr)
+            shutil.copy2(src, dest)
+        else:
+            if not ts:
+                print(f"No capture date for {src}; trimming without annotation", file=sys.stderr)
+            subprocess.run(annotate_cmd(src, dest, ts, font_size, font_file, start, end), check=True)
         out_rows.append((str(dest), ts, "", "", ""))
-
-    mounts = []
-    for d in mount_dirs:
-        mounts += ["-v", f"{d}:{d}"]
-
-    batch_script = "\n".join(batch_lines) + "\n"
-    subprocess.run(
-        ["docker", "run", "--rm", "-i", *mounts, DOCKER_IMAGE, "sh"],
-        input=batch_script, text=True, check=True,
-    )
 
     return out_rows, len(out_rows)
 
@@ -430,8 +416,9 @@ def cmd_annotate(args: argparse.Namespace) -> None:
     list_path = Path(args.list)
     out_dir = Path(args.output_dir).resolve()
     out_list_path = Path(args.output_list) if args.output_list else list_path.with_suffix(".annotated.csv")
+    font_file = args.font_file if args.font_file is not None else default_font_file()
 
-    rows, n = run_annotation(list_path, out_dir, args.date_format, args.font_size)
+    rows, n = run_annotation(list_path, out_dir, args.font_size, font_file)
 
     write_list_csv(out_list_path, rows)
     print(f"Annotated {n} items into {out_dir}; wrote {out_list_path}")
@@ -508,8 +495,9 @@ def cmd_render(args: argparse.Namespace) -> None:
     ensure_deps("render", args.skip_checks)
     if args.annotate:
         ensure_deps("annotate", args.skip_checks)
+        font_file = args.font_file if args.font_file is not None else default_font_file()
         with tempfile.TemporaryDirectory(prefix="slideshow-annotate-") as tmp_dir:
-            rows, _n = run_annotation(Path(args.list), Path(tmp_dir), args.date_format, args.font_size)
+            rows, _n = run_annotation(Path(args.list), Path(tmp_dir), args.font_size, font_file)
             files = [row[0] for row in rows]
             if not files:
                 sys.exit(f"error: no entries found in {args.list}")
@@ -531,7 +519,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_check = sub.add_parser(
         "check", help="Report which system dependencies are installed",
-        description="Check ffmpeg, exiftool and docker (CLI + daemon) and report status for each.",
+        description="Check ffmpeg, exiftool, and whether ffmpeg has the drawtext filter, and report status for each.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_check.set_defaults(func=cmd_check)
@@ -570,14 +558,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_annotate = sub.add_parser(
         "annotate", help="Burn each item's capture date into its bottom-right corner",
         description=(
-            "Burn exif_datestamp/filename_datestamp from a CSV list (falling back "
-            "to file mtime if both are blank) into the bottom-right corner of a "
-            "copy of each item. Images get a single annotated frame; videos are "
-            "re-encoded with the date burned into every frame and audio "
-            "preserved, trimmed to start_time/end_time if those columns are set "
-            "(ignored for still images). The text burn-in runs inside a small "
-            "Docker container, since Homebrew's ffmpeg build lacks the drawtext "
-            "filter."
+            "Burn exif_datestamp/filename_datestamp from a CSV list into the "
+            "bottom-right corner of a copy of each item; items with both blank "
+            "are copied through unannotated (still trimmed, for a video with "
+            "start_time/end_time set). Images get a single annotated frame; "
+            "videos are re-encoded with the date burned into every frame and "
+            "audio preserved, trimmed to start_time/end_time if those columns "
+            "are set (ignored for still images). Uses ffmpeg's drawtext filter "
+            "directly, so it needs a build with libfreetype (see `check`)."
         ),
         epilog="Example: slideshow.py annotate -l list.csv -O ~/Pictures/trip_annotated",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -585,8 +573,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_annotate.add_argument("-l", "--list", required=True, help="CSV list (filename,exif_datestamp,filename_datestamp,start_time,end_time)")
     p_annotate.add_argument("-O", "--output-dir", required=True, help="Directory to write annotated copies into")
     p_annotate.add_argument("-o", "--output-list", help="Output CSV list file (default: <list>.annotated.csv)")
-    p_annotate.add_argument("-F", "--date-format", default="%Y-%m-%d", help="strftime date-only format for the mtime fallback (default: %%Y-%%m-%%d -> 2024-01-31)")
     p_annotate.add_argument("-s", "--font-size", type=int, default=28, help="Font size (default: 28)")
+    p_annotate.add_argument("--font-file", default=None, help="Path to a TTF/TTC font file (default: auto-detect a system font)")
     p_annotate.add_argument("--skip-checks", action="store_true", help="Skip the dependency check before running")
     p_annotate.set_defaults(func=cmd_annotate)
 
@@ -608,8 +596,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("-c", "--crf", type=int, default=18, help="x264 CRF, lower = better/larger (default: 18)")
     p_render.add_argument("-p", "--preset", default="slow", help="x264 preset (default: slow)")
     p_render.add_argument("-a", "--annotate", action="store_true", help="Burn each photo's capture date into its bottom-right corner before rendering")
-    p_render.add_argument("-F", "--date-format", default="%Y-%m-%d", help="strftime date-only format for the mtime fallback (default: %%Y-%%m-%%d -> 2024-01-31; only used with --annotate)")
     p_render.add_argument("-s", "--font-size", type=int, default=28, help="Font size for the burned-in date (only used with --annotate, default: 28)")
+    p_render.add_argument("--font-file", default=None, help="Path to a TTF/TTC font file (only used with --annotate; default: auto-detect a system font)")
     p_render.add_argument("--skip-checks", action="store_true", help="Skip the dependency check before running")
     p_render.set_defaults(func=cmd_render)
 
