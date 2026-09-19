@@ -6,8 +6,11 @@ Subcommands, meant to be run in order:
   check          Report which system dependencies are installed.
   generate-list  Build an ordered CSV list of media paths + capture
                  dates (sorted by filename, descending, or randomized;
-                 optionally deduplicated by exact file content). Edit
-                 the resulting file freely before moving on.
+                 optionally deduplicated by exact file content). Any
+                 HEIC/HEIF file is converted to JPEG (ffmpeg's HEIC
+                 support is unreliable) and the list points at the
+                 converted copy. Edit the resulting file freely before
+                 moving on.
   annotate       (optional) Burn each item's capture date from the
                  CSV into its bottom-right corner; items with no date
                  are copied through unannotated. Works on still images
@@ -52,7 +55,7 @@ a list that mixes videos with images is not yet supported.
 
 import argparse
 import csv
-import glob
+import fnmatch
 import hashlib
 import os
 import platform
@@ -66,6 +69,7 @@ from datetime import datetime
 from pathlib import Path
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg"}
+HEIC_EXTS = {".heic", ".heif"}
 
 X264_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"]
 
@@ -110,11 +114,31 @@ def check_ffmpeg_drawtext() -> tuple[bool, str]:
     return (True, "available")
 
 
+def check_heic_converter() -> tuple[bool, str]:
+    """generate-list converts HEIC/HEIF to JPEG before anything reaches
+    ffmpeg -- ffmpeg's HEIC support is unreliable (ambiguous multi-stream
+    containers, no HEIC output muxer, -loop rejected since it's read via
+    the mov demuxer rather than image2). Only needed if the input
+    directory actually has HEIC/HEIF files, so this doesn't gate
+    generate-list itself -- see CHECKS below."""
+    if platform.system() == "Darwin":
+        ok = shutil.which("sips") is not None
+        return (ok, "sips available" if ok else "sips not found (should ship with macOS)")
+    if shutil.which("heif-convert"):
+        return (True, "heif-convert available")
+    if platform.system() == "Linux":
+        return (False, "heif-convert not found -- fix: sudo apt-get install -y libheif-examples")
+    return (False, "heif-convert not found on PATH")
+
+
 # (name, check function, commands that require it)
 CHECKS = [
     ("ffmpeg", check_ffmpeg, {"render", "annotate", "generate-list"}),
     ("exiftool", check_exiftool, {"generate-list"}),
     ("ffmpeg drawtext filter", check_ffmpeg_drawtext, {"annotate"}),
+    # Empty set: reported by `check` for visibility, but doesn't block
+    # generate-list -- only needed if a HEIC/HEIF file actually shows up.
+    ("HEIC/HEIF conversion", check_heic_converter, set()),
 ]
 
 
@@ -305,6 +329,28 @@ def dedupe_files(files: list[str]) -> list[str]:
     return deduped
 
 
+def convert_heic(path: str, out_dir: Path) -> str:
+    """Convert a HEIC/HEIF file to JPEG. ffmpeg's HEIC handling is
+    unreliable enough that it's not worth routing through it: these
+    containers can hold a main HEVC-coded tile grid alongside auxiliary
+    streams (e.g. a thumbnail), so ffmpeg's stream pick is ambiguous;
+    there's no HEIC output muxer to write annotated copies back to; and
+    -loop (needed by render's crossfade path) is an image2-demuxer-only
+    option, rejected because HEIC is read via the mov/mp4 demuxer."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / (Path(path).stem + ".jpg")
+    if platform.system() == "Darwin":
+        subprocess.run(["sips", "-s", "format", "jpeg", path, "--out", str(dest)], check=True, capture_output=True)
+    elif shutil.which("heif-convert"):
+        subprocess.run(["heif-convert", path, str(dest)], check=True, capture_output=True)
+    else:
+        sys.exit(
+            f"error: cannot convert HEIC file {path} -- run 'slideshow.py check' "
+            f"for the fix (heif-convert, from libheif, on Linux)"
+        )
+    return str(dest)
+
+
 def cmd_generate_list(args: argparse.Namespace) -> None:
     ensure_deps("generate-list", args.skip_checks)
 
@@ -312,14 +358,15 @@ def cmd_generate_list(args: argparse.Namespace) -> None:
     if not input_dir.is_dir():
         sys.exit(f"error: not a directory: {input_dir}")
 
-    patterns = [p.strip() for p in args.glob.split(",") if p.strip()]
+    # Matched case-insensitively: macOS's filesystem is case-insensitive for
+    # access but glob.glob's own pattern matching is not, so "*.jpg" would
+    # otherwise silently miss "*.JPG" -- easy to hit in practice since e.g.
+    # iOS exports HEIC as ".HEIC" while some other tools use ".heic".
+    patterns = [p.strip().lower() for p in args.glob.split(",") if p.strip()]
     files: list[str] = []
-    seen = set()
-    for pattern in patterns:
-        for f in glob.glob(str(input_dir / pattern)):
-            if os.path.isfile(f) and f not in seen:
-                seen.add(f)
-                files.append(f)
+    for entry in sorted(input_dir.iterdir()):
+        if entry.is_file() and any(fnmatch.fnmatch(entry.name.lower(), pat) for pat in patterns):
+            files.append(str(entry))
 
     if not files:
         sys.exit(f"error: no files matched '{args.glob}' in {input_dir}")
@@ -338,10 +385,16 @@ def cmd_generate_list(args: argparse.Namespace) -> None:
     for f in files:
         exif_ds = exif_datestamp(f, args.date_format)
         filename_ds = "" if exif_ds else filename_datestamp(f, args.date_format)
-        if is_video(f):
-            rows.append((f, exif_ds, filename_ds, "00:00:00", video_duration_str(f)))
+
+        resolved = f
+        if Path(f).suffix.lower() in HEIC_EXTS:
+            resolved = convert_heic(f, input_dir / ".heic-converted")
+            print(f"Converted HEIC to JPEG: {f} -> {resolved}", file=sys.stderr)
+
+        if is_video(resolved):
+            rows.append((resolved, exif_ds, filename_ds, "00:00:00", video_duration_str(resolved)))
         else:
-            rows.append((f, exif_ds, filename_ds, "", ""))
+            rows.append((resolved, exif_ds, filename_ds, "", ""))
 
     out_path = Path(args.output)
     write_list_csv(out_path, rows)
@@ -395,7 +448,10 @@ def annotate_cmd(src: Path, dest: Path, ts: str, font_size: int, font_file: str,
         return cmd
     # images only reach here with ts set -- the no-date/no-trim case is a
     # plain copy, handled before this is called.
-    return ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-frames:v", "1", "-q:v", "2", str(dest), "-loglevel", "error"]
+    # -update 1: some containers (e.g. HEIC) make the image2 muxer think
+    # this is a numbered image sequence and refuse to write a plain
+    # filename without it.
+    return ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-frames:v", "1", "-update", "1", "-q:v", "2", str(dest), "-loglevel", "error"]
 
 
 def run_annotation(list_path: Path, out_dir: Path, font_scale: float, font_file: str) -> tuple[list[tuple[str, str, str, str, str]], int]:
@@ -584,7 +640,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_gen.add_argument("-i", "--input-dir", required=True, help="Directory of images/videos")
-    p_gen.add_argument("-g", "--glob", default="*.jpg", help="Comma-separated glob(s), e.g. \"*.jpg,*.mp4\" (default: *.jpg)")
+    p_gen.add_argument("-g", "--glob", default="*.jpg", help="Comma-separated glob(s), matched case-insensitively, e.g. \"*.jpg,*.heic,*.mp4\" (default: *.jpg)")
     p_gen.add_argument("-o", "--output", default="list.csv", help="Output CSV list file (default: list.csv)")
     p_gen.add_argument("-R", "--random", action="store_true", help="Randomize order (default: sort by filename, descending)")
     p_gen.add_argument("-D", "--dedupe", action="store_true", help="Skip files whose content exactly matches one already kept (first occurrence wins)")
