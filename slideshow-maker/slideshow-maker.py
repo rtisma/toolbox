@@ -67,6 +67,8 @@ from pathlib import Path
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg"}
 
+X264_PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"]
+
 LIST_HEADER = ["filename", "exif_datestamp", "filename_datestamp", "start_time", "end_time"]
 
 # 8 digits not adjacent to another digit, e.g. "IMG_20191028_143022.jpg" -> "20191028".
@@ -253,6 +255,20 @@ def filename_datestamp(path: str, fmt: str) -> str:
     return ""
 
 
+def probe_height(path: str) -> int:
+    """Return the media's pixel height, via ffprobe. Falls back to 1080
+    (a plausible render-target height) if probing fails for any reason."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=height", "-of", "default=nk=1:nw=1", path],
+            capture_output=True, text=True, check=True,
+        )
+        return int(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError):
+        return 1080
+
+
 def video_duration_str(path: str) -> str:
     """Return the video's duration as HH:MM:SS (whole seconds, floored)."""
     result = subprocess.run(
@@ -382,11 +398,19 @@ def annotate_cmd(src: Path, dest: Path, ts: str, font_size: int, font_file: str,
     return ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-frames:v", "1", "-q:v", "2", str(dest), "-loglevel", "error"]
 
 
-def run_annotation(list_path: Path, out_dir: Path, font_size: int, font_file: str) -> tuple[list[tuple[str, str, str, str, str]], int]:
+def run_annotation(list_path: Path, out_dir: Path, font_scale: float, font_file: str) -> tuple[list[tuple[str, str, str, str, str]], int]:
     """Burn dates (and, for videos, trim to start_time/end_time) into copies
     of every real entry in list_path. If an item has neither exif_datestamp
     nor filename_datestamp, no text is burned in -- it's trimmed (if a video
     with start_time/end_time set) or otherwise copied through unchanged.
+
+    Font size is font_scale * the item's own pixel height, not a fixed pixel
+    count: render later fits each item into the output canvas by scaling to
+    the binding dimension (typically height, for both portrait and landscape
+    photos, when the render target is landscape -- render's default and
+    common case), so a fixed pixel size burned in pre-scale would come out
+    much smaller on a portrait photo than a landscape one post-scale. Sizing
+    off each item's own height cancels that out.
 
     Returns (rows, count) where rows is [(dest_path, exif_datestamp, "", "", ""), ...]
     -- filename_datestamp/start/end come back blank because the resolved date
@@ -412,9 +436,12 @@ def run_annotation(list_path: Path, out_dir: Path, font_size: int, font_file: st
             print(f"No capture date for {src}; copying without annotation", file=sys.stderr)
             shutil.copy2(src, dest)
         else:
-            if not ts:
+            font_size_px = 0
+            if ts:
+                font_size_px = max(1, round(probe_height(str(src)) * font_scale))
+            else:
                 print(f"No capture date for {src}; trimming without annotation", file=sys.stderr)
-            subprocess.run(annotate_cmd(src, dest, ts, font_size, font_file, start, end), check=True)
+            subprocess.run(annotate_cmd(src, dest, ts, font_size_px, font_file, start, end), check=True)
         out_rows.append((str(dest), ts, "", "", ""))
 
     return out_rows, len(out_rows)
@@ -428,7 +455,7 @@ def cmd_annotate(args: argparse.Namespace) -> None:
     out_list_path = Path(args.output_list) if args.output_list else list_path.with_suffix(".annotated.csv")
     font_file = args.font_file if args.font_file is not None else default_font_file()
 
-    rows, n = run_annotation(list_path, out_dir, args.font_size, font_file)
+    rows, n = run_annotation(list_path, out_dir, args.font_scale, font_file)
 
     write_list_csv(out_list_path, rows)
     print(f"Annotated {n} items into {out_dir}; wrote {out_list_path}")
@@ -507,7 +534,7 @@ def cmd_render(args: argparse.Namespace) -> None:
         ensure_deps("annotate", args.skip_checks)
         font_file = args.font_file if args.font_file is not None else default_font_file()
         with tempfile.TemporaryDirectory(prefix="slideshow-annotate-") as tmp_dir:
-            rows, _n = run_annotation(Path(args.list), Path(tmp_dir), args.font_size, font_file)
+            rows, _n = run_annotation(Path(args.list), Path(tmp_dir), args.font_scale, font_file)
             files = [row[0] for row in rows]
             if not files:
                 sys.exit(f"error: no entries found in {args.list}")
@@ -583,7 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_annotate.add_argument("-l", "--list", required=True, help="CSV list (filename,exif_datestamp,filename_datestamp,start_time,end_time)")
     p_annotate.add_argument("-O", "--output-dir", required=True, help="Directory to write annotated copies into")
     p_annotate.add_argument("-o", "--output-list", help="Output CSV list file (default: <list>.annotated.csv)")
-    p_annotate.add_argument("-s", "--font-size", type=int, default=28, help="Font size (default: 28)")
+    p_annotate.add_argument("-s", "--font-scale", type=float, default=0.03, help="Font size as a fraction of each item's own pixel height, e.g. 0.03 -> ~32px on a 1080-tall image, ~65px on a 2160-tall one (default: 0.03)")
     p_annotate.add_argument("--font-file", default=None, help="Path to a TTF/TTC font file (default: auto-detect a system font)")
     p_annotate.add_argument("--skip-checks", action="store_true", help="Skip the dependency check before running")
     p_annotate.set_defaults(func=cmd_annotate)
@@ -604,9 +631,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("-r", "--resolution", default="1920x1080", help="Output resolution WxH (default: 1920x1080)")
     p_render.add_argument("-f", "--fade", type=float, default=0, help="Crossfade duration in seconds (default: 0 = hard cut)")
     p_render.add_argument("-c", "--crf", type=int, default=18, help="x264 CRF, lower = better/larger (default: 18)")
-    p_render.add_argument("-p", "--preset", default="slow", help="x264 preset (default: slow)")
+    p_render.add_argument("-p", "--preset", default="slow", choices=X264_PRESETS, help="x264 preset (default: slow)")
     p_render.add_argument("-a", "--annotate", action="store_true", help="Burn each photo's capture date into its bottom-right corner before rendering")
-    p_render.add_argument("-s", "--font-size", type=int, default=28, help="Font size for the burned-in date (only used with --annotate, default: 28)")
+    p_render.add_argument("-s", "--font-scale", type=float, default=0.03, help="Font size as a fraction of each item's own pixel height (only used with --annotate, default: 0.03)")
     p_render.add_argument("--font-file", default=None, help="Path to a TTF/TTC font file (only used with --annotate; default: auto-detect a system font)")
     p_render.add_argument("--skip-checks", action="store_true", help="Skip the dependency check before running")
     p_render.set_defaults(func=cmd_render)
