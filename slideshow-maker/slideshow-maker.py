@@ -38,9 +38,11 @@ skipped.
 Dependencies: ffmpeg (and ffprobe) on PATH for `render`/`generate-list`;
 exiftool on PATH for `generate-list`; ffmpeg on PATH *with the drawtext
 filter compiled in* for `annotate` (Homebrew's default ffmpeg formula
-lacks it -- `check` reports this separately from plain ffmpeg
-presence; install a build with libfreetype, e.g. ffmpeg-full, if it's
-missing). Commands that need dependencies check them first; pass
+lacks it -- `check` reports this separately from plain ffmpeg presence,
+and its message includes the fix: `brew install ffmpeg-full && brew
+link --overwrite ffmpeg-full` on macOS, `sudo apt-get install ffmpeg`
+on Ubuntu/Debian, which normally has it already). Commands that need
+dependencies check them first; pass
 --skip-checks to bypass that.
 
 Note: render's per-item duration/crossfade logic assumes every list
@@ -53,6 +55,7 @@ import csv
 import glob
 import hashlib
 import os
+import platform
 import random
 import re
 import shutil
@@ -89,12 +92,19 @@ def check_exiftool() -> tuple[bool, str]:
 def check_ffmpeg_drawtext() -> tuple[bool, str]:
     """annotate burns text in via ffmpeg's drawtext filter, which needs
     ffmpeg built with libfreetype. Homebrew's default ffmpeg formula lacks
-    it (use ffmpeg-full, or a build with --enable-libfreetype)."""
+    it; Ubuntu/Debian's apt package normally has it already."""
     if shutil.which("ffmpeg") is None:
         return (False, "ffmpeg not found on PATH")
     result = subprocess.run(["ffmpeg", "-h", "filter=drawtext"], capture_output=True, text=True)
     if "Unknown filter" in result.stdout or "Unknown filter" in result.stderr:
-        return (False, "ffmpeg was built without the drawtext filter (needs libfreetype)")
+        system = platform.system()
+        if system == "Darwin":
+            fix = "brew install ffmpeg-full && brew link --overwrite ffmpeg-full"
+        elif system == "Linux":
+            fix = "sudo apt-get update && sudo apt-get install -y ffmpeg"
+        else:
+            fix = "install an ffmpeg build with libfreetype (--enable-libfreetype)"
+        return (False, f"ffmpeg was built without the drawtext filter (needs libfreetype) -- fix: {fix}")
     return (True, "available")
 
 
